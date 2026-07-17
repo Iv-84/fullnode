@@ -9,7 +9,7 @@ pub struct DiamondMiningResult {
     pub nonce_space: u64,
     pub nonce: u64,
     pub diamond_string: [u8; 16],
-    pub success: Option<HacdMint>,
+    pub successes: Vec<HacdMint>,
     pub elapsed_secs: f64,
 }
 
@@ -37,4 +37,17 @@ pub fn diamond_more_power(dst: &[u8], src: &[u8]) -> bool {
         }
     }
     false
+}
+
+pub fn diamond_hash_result_valid(name: &[u8]) -> bool {
+    x16rs::check_diamond_hash_result(name).is_some()
+}
+
+pub fn diamond_candidate_more_power(dst: &[u8], src: &[u8]) -> bool {
+    let dst_valid = diamond_hash_result_valid(dst);
+    let src_valid = diamond_hash_result_valid(src);
+    if dst_valid != src_valid {
+        return dst_valid;
+    }
+    diamond_more_power(dst, src)
 }

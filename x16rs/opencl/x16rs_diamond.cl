@@ -48,6 +48,27 @@ inline bool diamond_more_power(const uchar *dst,
     return 0;
 }
 
+inline bool diamond_hash_result_valid(const uchar *name)
+{
+    const uchar o = (uchar)'0';
+    for (uint i = 0u; i < 10u; i++) {
+        if (name[i] != o) return 0;
+    }
+    for (uint i = 10u; i < 16u; i++) {
+        if (name[i] == o) return 0;
+    }
+    return 1;
+}
+
+inline bool diamond_candidate_more_power(const uchar *dst,
+                                         const uchar *src)
+{
+    bool dst_valid = diamond_hash_result_valid(dst);
+    bool src_valid = diamond_hash_result_valid(src);
+    if (dst_valid != src_valid) return dst_valid;
+    return diamond_more_power(dst, src);
+}
+
 __attribute__((work_group_size_hint(256, 1, 1)))
 __kernel void x16rs_diamond(
     __constant const block_diamond_t* input_stuff,
@@ -57,7 +78,10 @@ __kernel void x16rs_diamond(
     __global hash_32* global_hashes,
     __global unsigned int* global_order,
     __global hash_32* best_hashes,
-    __global ulong* best_nonces
+    __global ulong* best_nonces,
+    __global ulong* candidate_nonces,
+    volatile __global unsigned int* candidate_count,
+    const unsigned int max_candidates
 ) {
     const unsigned int local_id = get_local_id(0);
     const unsigned int local_size = get_local_size(0);
@@ -101,14 +125,22 @@ __kernel void x16rs_diamond(
         mixtab0, mixtab1, mixtab2, mixtab3
     );
     
-    unsigned int best_hash = 0;
+    unsigned int best_hash = index;
     diamond_t best_name;
-    for (unsigned int i = 1; i < unit_size; i++) {
+    diamond_hash(local_hashes[index].h1, best_name.h1);
+    for (unsigned int i = 0; i < unit_size; i++) {
         // Get diamond name
+        unsigned int now_hash = index + i;
         diamond_t now_name;
-        diamond_hash(local_hashes[index + i].h1, now_name.h1);
-        if (diamond_more_power(now_name.h1, best_name.h1) == 1) {
-            best_hash = index + i;
+        diamond_hash(local_hashes[now_hash].h1, now_name.h1);
+        if (diamond_hash_result_valid(now_name.h1) == 1) {
+            unsigned int slot = atomic_inc(candidate_count);
+            if (slot < max_candidates) {
+                candidate_nonces[slot] = global_offset + i;
+            }
+        }
+        if (i > 0 && diamond_candidate_more_power(now_name.h1, best_name.h1) == 1) {
+            best_hash = now_hash;
             best_name = now_name;
         }
     }
@@ -128,7 +160,7 @@ __kernel void x16rs_diamond(
             diamond_t pair_name;
             diamond_hash(local_hashes[idx_current].h1, current_name.h1);
             diamond_hash(local_hashes[idx_pair].h1, pair_name.h1);
-            if (diamond_more_power(pair_name.h1, current_name.h1) == 1) {
+            if (diamond_candidate_more_power(pair_name.h1, current_name.h1) == 1) {
                 local_hashes[idx_current] = local_hashes[idx_pair];
                 local_nonces[local_id] = local_nonces[local_id + smax];
             }

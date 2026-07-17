@@ -1,6 +1,6 @@
 #[cfg(feature = "ocl")]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{LazyLock, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use field::{Address, DiamondName, DiamondNumber, Encode, Fixed8, Hash};
 use mint::action_diamond::HacdMint;
 use mint::diamond_mining::{
-    DiamondMiningResult, HASH_WIDTH, check_diamond_success, diamond_more_power,
+    DiamondMiningResult, HASH_WIDTH, check_diamond_success, diamond_candidate_more_power,
 };
 use reqwest::blocking::Client as HttpClient;
 use sys::Ret;
@@ -49,6 +49,7 @@ struct DiaWorkConf {
     platformid: u32,
     #[cfg_attr(not(feature = "ocl"), allow(dead_code))]
     deviceids: String,
+    mine_height_tails: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -64,6 +65,7 @@ enum MinerBackend {
 }
 
 static MINING_DIAMOND_NUM: AtomicU32 = AtomicU32::new(0);
+static STANDBY_BLOCK_HEIGHT: AtomicU64 = AtomicU64::new(0);
 static MINING_PREV_HASH: LazyLock<RwLock<Hash>> = LazyLock::new(|| RwLock::new(Hash::default()));
 
 impl DiaWorkConf {
@@ -71,6 +73,15 @@ impl DiaWorkConf {
         let ini = sys::load_config("diaworker.config.ini")?;
         let sec = sys::ini_section(&ini, "default");
         let gpu = sys::ini_section(&ini, "gpu");
+        let legacy_height_gate =
+            sys::ini_must_bool(sec, "mine_only_height_tail_1_or_6", false);
+        let configured_tails =
+            parse_diamond_mining_height_tails(&sys::ini_must(sec, "mine_heights", ""))?;
+        let mine_height_tails = if configured_tails.is_empty() && legacy_height_gate {
+            vec![1, 6]
+        } else {
+            configured_tails
+        };
         Ok(Self {
             rpcaddr: super::plain_http_host(&sys::ini_must(sec, "connect", "127.0.0.1:8082"))?,
             threads: sys::ini_must_u64(sec, "supervene", 2).max(1) as usize,
@@ -83,6 +94,7 @@ impl DiaWorkConf {
             opencldir: sys::ini_must(gpu, "opencl_dir", "opencl/"),
             platformid: sys::ini_must_u64(gpu, "platform_id", 0) as u32,
             deviceids: sys::ini_must(gpu, "device_ids", ""),
+            mine_height_tails,
         })
     }
 }
@@ -152,17 +164,22 @@ fn result_loop(conf: DiaWorkConf, rx: mpsc::Receiver<DiamondMiningResult>, worke
     loop {
         let mut count = 0usize;
         let mut total_nonce_space = 0u64;
-        let mut total_elapsed = 0.0;
+        let mut total_nonce_rate = 0.0;
         let mut best_batch: Option<DiamondMiningResult> = None;
         while let Ok(result) = rx.try_recv() {
+            if result.number != MINING_DIAMOND_NUM.load(Ordering::Relaxed) {
+                continue;
+            }
             total_nonce_space = total_nonce_space.saturating_add(result.nonce_space);
-            total_elapsed += result.elapsed_secs;
+            if result.elapsed_secs.is_finite() && result.elapsed_secs > 0.0 {
+                total_nonce_rate += result.nonce_space as f64 / result.elapsed_secs;
+            }
             if best_batch.as_ref().map_or(true, |best| {
-                diamond_more_power(&result.diamond_string, &best.diamond_string)
+                diamond_candidate_more_power(&result.diamond_string, &best.diamond_string)
             }) {
                 best_batch = Some(result.clone());
             }
-            if let Some(success) = result.success {
+            for success in result.successes {
                 push_diamond_mining_success(&conf, success);
             }
             count += 1;
@@ -172,11 +189,9 @@ fn result_loop(conf: DiaWorkConf, rx: mpsc::Receiver<DiamondMiningResult>, worke
         }
 
         if let Some(best) = best_batch {
-            if diamond_more_power(&best.diamond_string, &best_seen) {
+            if diamond_candidate_more_power(&best.diamond_string, &best_seen) {
                 best_seen = best.diamond_string;
             }
-            let secs = (total_elapsed / count.max(1) as f64).max(0.001);
-            let rate = total_nonce_space as f64 / secs;
             println!(
                 "[diaworker] number={} start={} scanned={} best={} global_best={} rate={}/s",
                 best.number,
@@ -184,7 +199,7 @@ fn result_loop(conf: DiaWorkConf, rx: mpsc::Receiver<DiamondMiningResult>, worke
                 total_nonce_space,
                 String::from_utf8_lossy(&best.diamond_string),
                 String::from_utf8_lossy(&best_seen),
-                mint::difficulty::rates_to_show(rate)
+                mint::difficulty::rates_to_show(total_nonce_rate)
             );
         }
         thread::sleep(Duration::from_millis(77));
@@ -254,7 +269,7 @@ fn worker_loop(
                 }
                 nonce_space = nonce_space.max(1);
             }
-            if number < MINING_DIAMOND_NUM.load(Ordering::Relaxed) {
+            if number != MINING_DIAMOND_NUM.load(Ordering::Relaxed) {
                 break;
             }
         }
@@ -309,13 +324,9 @@ fn do_diamond_group_mining(
         nonce_space,
         nonce: 0,
         diamond_string: [b'W'; 16],
-        success: None,
+        successes: Vec::new(),
         elapsed_secs: 0.0,
     };
-    let mut best_first_hash = [0u8; HASH_WIDTH];
-    let mut best_result_hash = [0u8; HASH_WIDTH];
-    let mut best_nonce_bytes = [0u8; 8];
-
     let nonce_end = nonce_start.saturating_add(nonce_space);
     for nonce in nonce_start..nonce_end {
         let nonce_bytes = nonce.to_be_bytes();
@@ -327,29 +338,43 @@ fn do_diamond_group_mining(
             reward_address.as_array(),
             custom_nonce,
         );
-        if diamond_more_power(&diamond_string, &best.diamond_string) {
+        if let Some(diamond_name) =
+            check_diamond_success(number, first_hash, result_hash, diamond_string)
+        {
+            best.successes.push(build_diamond_mint(
+                number,
+                diamond_name,
+                prev_hash,
+                nonce_bytes,
+                reward_address,
+                custom_message,
+            ));
+        }
+        if diamond_candidate_more_power(&diamond_string, &best.diamond_string) {
             best.nonce = nonce;
             best.diamond_string = diamond_string;
-            best_first_hash = first_hash;
-            best_result_hash = result_hash;
-            best_nonce_bytes = nonce_bytes;
         }
     }
-
-    if let Some(diamond_name) = check_diamond_success(
-        number,
-        best_first_hash,
-        best_result_hash,
-        best.diamond_string,
-    ) {
-        let mut act = HacdMint::with(DiamondName::from(diamond_name), DiamondNumber::from(number));
-        act.d.prev_hash = *prev_hash;
-        act.d.nonce = Fixed8::from(best_nonce_bytes);
-        act.d.address = *reward_address;
-        act.d.custom_message = *custom_message;
-        best.success = Some(act);
-    }
     best
+}
+
+fn build_diamond_mint(
+    number: u32,
+    diamond_name: [u8; 6],
+    prev_hash: &Hash,
+    nonce: [u8; 8],
+    reward_address: &Address,
+    custom_message: &Hash,
+) -> HacdMint {
+    let mut act = HacdMint::with(
+        DiamondName::from(diamond_name),
+        DiamondNumber::from(number),
+    );
+    act.d.prev_hash = *prev_hash;
+    act.d.nonce = Fixed8::from(nonce);
+    act.d.address = *reward_address;
+    act.d.custom_message = *custom_message;
+    act
 }
 
 fn load_init(conf: &mut DiaWorkConf) -> Ret<()> {
@@ -390,10 +415,16 @@ fn pull_next_diamond(conf: &DiaWorkConf) {
             return;
         }
     };
+    let pending_height = latest.get_u64("height").unwrap_or(0).saturating_add(1);
+    if !is_allowed_diamond_mining_height(pending_height, &conf.mine_height_tails) {
+        enter_diamond_mining_standby(pending_height, &conf.mine_height_tails);
+        return;
+    }
     let next_number = latest.get_u64("diamond").unwrap_or(0) as u32 + 1;
     if next_number == 1 {
         *MINING_PREV_HASH.write().unwrap() = mint::genesis::genesis_block_hash();
         MINING_DIAMOND_NUM.store(next_number, Ordering::Relaxed);
+        mark_diamond_mining_active();
         return;
     }
     if next_number <= mining_num {
@@ -422,7 +453,41 @@ fn pull_next_diamond(conf: &DiaWorkConf) {
     };
     *MINING_PREV_HASH.write().unwrap() = prev_hash;
     MINING_DIAMOND_NUM.store(next_number, Ordering::Relaxed);
+    mark_diamond_mining_active();
     println!("[diaworker] mining diamond number {}", next_number);
+}
+
+fn parse_diamond_mining_height_tails(raw: &str) -> Ret<Vec<u8>> {
+    let mut tails = Vec::new();
+    for part in raw.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+        let tail = part.parse::<u8>().map_err(|_| {
+            sys::Error::normal("mine_heights must be a comma-separated list of tails 0..9")
+        })?;
+        if tail > 9 {
+            return sys::errf!("mine_heights must contain only tails 0..9");
+        }
+        if !tails.contains(&tail) {
+            tails.push(tail);
+        }
+    }
+    Ok(tails)
+}
+
+fn is_allowed_diamond_mining_height(height: u64, tails: &[u8]) -> bool {
+    tails.is_empty() || tails.contains(&((height % 10) as u8))
+}
+
+fn enter_diamond_mining_standby(height: u64, tails: &[u8]) {
+    let previous_number = MINING_DIAMOND_NUM.swap(0, Ordering::Relaxed);
+    let previous_height = STANDBY_BLOCK_HEIGHT.swap(height, Ordering::Relaxed);
+    if previous_number > 0 || previous_height != height {
+        let tails = tails.iter().map(u8::to_string).collect::<Vec<_>>().join(",");
+        println!("[diaworker] standby at block height {height}; waiting for tail {tails}");
+    }
+}
+
+fn mark_diamond_mining_active() {
+    STANDBY_BLOCK_HEIGHT.store(0, Ordering::Relaxed);
 }
 
 fn push_diamond_mining_success(conf: &DiaWorkConf, success: HacdMint) {

@@ -14,6 +14,9 @@ pub struct OpenCLResources {
     pub queue: Queue,
     pub buffer_best_nonces: Buffer<u32>,
     pub buffer_best_nonces_diamond: Buffer<u64>,
+    pub buffer_diamond_candidate_count: Buffer<u32>,
+    pub buffer_diamond_candidate_nonces: Buffer<u64>,
+    pub diamond_candidate_capacity: usize,
     pub buffer_global_hashes: Buffer<u8>,
     pub buffer_global_order: Buffer<u32>,
     pub buffer_best_hashes: Buffer<u8>,
@@ -149,6 +152,11 @@ pub fn initialize_opencl(
         };
 
         let queue = Queue::new(&context, device, None).expect("can't create OpenCL event queue");
+        let diamond_candidate_capacity = if diamond_mining {
+            global_work_size as usize
+        } else {
+            1
+        };
         opencl_resource_devices.push(OpenCLResources {
             program: program.clone(),
             queue: queue.clone(),
@@ -164,6 +172,19 @@ pub fn initialize_opencl(
                 .len(workgroups)
                 .build()
                 .expect("can't create buffer_best_nonces_diamond"),
+            buffer_diamond_candidate_count: Buffer::<u32>::builder()
+                .queue(queue.clone())
+                .flags(ocl::core::MEM_READ_WRITE)
+                .len(1)
+                .build()
+                .expect("can't create buffer_diamond_candidate_count"),
+            buffer_diamond_candidate_nonces: Buffer::<u64>::builder()
+                .queue(queue.clone())
+                .flags(ocl::core::MEM_WRITE_ONLY)
+                .len(diamond_candidate_capacity)
+                .build()
+                .expect("can't create buffer_diamond_candidate_nonces"),
+            diamond_candidate_capacity,
             buffer_global_hashes: Buffer::<u8>::builder()
                 .queue(queue.clone())
                 .flags(ocl::core::MEM_READ_WRITE)

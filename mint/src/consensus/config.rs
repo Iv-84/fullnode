@@ -6,6 +6,9 @@ pub struct MintConf {
     pub chain_id: ChainId,
     /// Genesis consensus configuration, persisted in state after initialization.
     pub diamond_form: bool,
+    /// Enforce the live highest-diamond-bid fence. Disabling it retains the
+    /// consensus minimum bid and transaction-position checks.
+    pub check_highest_diamond_bid: bool,
     /// Sync block of max height; `0` means unlimited (config `[mint].height_max`,
     /// dev parity). Blocks above this height are rejected at insert.
     pub sync_maxh: u64,
@@ -16,6 +19,7 @@ impl Default for MintConf {
         Self {
             chain_id: ChainId::MAINNET,
             diamond_form: true,
+            check_highest_diamond_bid: true,
             sync_maxh: 0,
         }
     }
@@ -29,10 +33,24 @@ impl MintConf {
     /// Decode the `[mint]` INI section. `height_max` (old key) maps onto `sync_maxh`;
     /// unknown keys with present values are rejected (serde `deny_unknown_fields` equivalent).
     pub fn from_ini(sec: &IniSec) -> sys::Ret<Self> {
-        ini_deny_unknown(sec, "mint", &["chain_id", "diamond_form", "height_max"])?;
+        ini_deny_unknown(
+            sec,
+            "mint",
+            &[
+                "chain_id",
+                "diamond_form",
+                "check_highest_diamond_bid",
+                "height_max",
+            ],
+        )?;
         let mut cfg = Self::default();
         cfg.chain_id = ChainId::new(ini_u32(sec, "chain_id", cfg.chain_id.get())?);
         cfg.diamond_form = ini_bool(sec, "diamond_form", cfg.diamond_form)?;
+        cfg.check_highest_diamond_bid = ini_bool(
+            sec,
+            "check_highest_diamond_bid",
+            cfg.check_highest_diamond_bid,
+        )?;
         cfg.sync_maxh = ini_u64(sec, "height_max", cfg.sync_maxh)?;
         Ok(cfg)
     }

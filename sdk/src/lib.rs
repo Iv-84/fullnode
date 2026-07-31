@@ -23,6 +23,7 @@ pub mod policy;
 pub mod profile;
 pub mod schema;
 pub mod service;
+pub mod tex;
 pub mod vm;
 
 pub use account::{address_from_public_key, verify_address, verify_signature};

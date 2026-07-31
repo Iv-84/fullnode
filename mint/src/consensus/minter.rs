@@ -723,7 +723,11 @@ impl Consensus for HacashConsensus {
         if fast_sync {
             return Ok(());
         }
-        block_check::check_highest_bid(&self.bidding, pkg, parent_state)
+        if self.mint_conf.check_highest_diamond_bid {
+            block_check::check_highest_bid(&self.bidding, pkg, parent_state)
+        } else {
+            block_check::check_diamond_mint_bid_floor(pkg)
+        }
     }
 
     fn on_stable_block(&self, block: &dyn Block, _view: &dyn ChainView) -> Rerr {

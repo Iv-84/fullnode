@@ -381,7 +381,41 @@ fn low_bits_mask(bits: u32) -> u128 {
 
 #[inline(always)]
 fn mul_wide_u128(a: u128, b: u128) -> (u128, u128) {
-    let (lo, hi) = a.carrying_mul(b, 0);
+    // Stable replacement for nightly `u128::carrying_mul`:
+    // compute a 256-bit product from two 128-bit limbs.
+    const MASK64: u128 = (1u128 << 64) - 1;
+
+    let a0 = a & MASK64;
+    let a1 = a >> 64;
+    let b0 = b & MASK64;
+    let b1 = b >> 64;
+
+    let p00 = a0 * b0;
+    let p01 = a0 * b1;
+    let p10 = a1 * b0;
+    let p11 = a1 * b1;
+
+    let p00_lo = p00 & MASK64;
+    let p00_hi = p00 >> 64;
+    let p01_lo = p01 & MASK64;
+    let p01_hi = p01 >> 64;
+    let p10_lo = p10 & MASK64;
+    let p10_hi = p10 >> 64;
+    let p11_lo = p11 & MASK64;
+    let p11_hi = p11 >> 64;
+
+    let r1_sum = p00_hi + p01_lo + p10_lo;
+    let r1 = r1_sum & MASK64;
+    let carry1 = r1_sum >> 64;
+
+    let r2_sum = p01_hi + p10_hi + p11_lo + carry1;
+    let r2 = r2_sum & MASK64;
+    let carry2 = r2_sum >> 64;
+
+    let r3 = p11_hi + carry2;
+
+    let lo = p00_lo | (r1 << 64);
+    let hi = r2 | (r3 << 64);
     (hi, lo)
 }
 

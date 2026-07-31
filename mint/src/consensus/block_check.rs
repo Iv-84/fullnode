@@ -7,7 +7,9 @@ use sys::{Rerr, errf};
 
 use crate::MintConf;
 use crate::action::diamond::HacdMint;
-use crate::action::util::pickout_diamond_mint_action;
+use crate::action::util::{
+    pickout_diamond_mint_action, pickout_diamond_mint_action_from_block,
+};
 use crate::bidding::DiamondBidding;
 use crate::coinbase::{verify_coinbase, verify_coinbase_privakey};
 use crate::difficulty::{DifficultyGnr, hash_bigger_than, u32_to_hash};
@@ -240,4 +242,18 @@ pub fn check_highest_bid(
     prev_state: &dyn base::StateRead,
 ) -> Rerr {
     bidding.check_highest_bid(pkg, prev_state)
+}
+
+pub fn check_diamond_mint_bid_floor(pkg: &BlkPkg) -> Rerr {
+    let height = pkg.height();
+    if height % 5 != 0 {
+        return Ok(());
+    }
+    let Some((tx_index, tx, action)) = pickout_diamond_mint_action_from_block(pkg.block()) else {
+        return Ok(());
+    };
+    if tx_index != 1 && height > 600_000 {
+        return errf!("diamond mint transaction must be the first tx in block");
+    }
+    check_diamond_mint_minimum_bidding_fee(height, tx.as_ref(), &action)
 }

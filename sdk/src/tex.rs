@@ -11,6 +11,7 @@ pub struct TexActionResult {
     pub address: String,
     pub side: String,
     pub serial: u64,
+    pub texauth_serial: u64,
     pub price_mei_per_hacp: u64,
     pub lot_hacp: u64,
     pub total_hacp: u64,
@@ -28,6 +29,7 @@ pub struct TexOrderResult {
     pub address: String,
     pub side: String,
     pub serial: u64,
+    pub texauth_serial: u64,
     pub price_mei_per_hacp: u64,
     pub total_hacp: u64,
     pub maker_balance_at_signing: u64,
@@ -126,6 +128,7 @@ fn create_tex_order_bundle(
     acc: &SysAccount,
     side: &str,
     serial: u64,
+    texauth_serial: u64,
     price_mei_per_hacp: u64,
     denom: u64,
     total_hacp: u64,
@@ -147,6 +150,12 @@ fn create_tex_order_bundle(
     let mut act = TexCellAct::create_by(Address::from(*acc.address()));
     act.add_cell(Box::new(CellCondHeightAtMost::new(expire_height)))?;
     act.add_cell(Box::new(CellCondChainIdEq::new(chain_id)))?;
+    // TEXAUTH is lent by the exchange immediately before this bundle runs.
+    // A copied standalone bundle therefore fails before it can move trade funds.
+    act.add_cell(Box::new(CellTrsAssetPay::new(tex_asset(
+        texauth_serial,
+        1,
+    )?)))?;
     if side == TEX_SIDE_SELL_HACP {
         // Maker recauda HAC → paga su lado: cobra lot_mei − fee.
         let maker_get = lot_mei
@@ -200,6 +209,7 @@ fn finish_tex_action(
     acc: &SysAccount,
     side: &str,
     serial: u64,
+    texauth_serial: u64,
     price_mei_per_hacp: u64,
     lot_hacp: u64,
     total_hacp: u64,
@@ -221,6 +231,7 @@ fn finish_tex_action(
         address: Address::from(*acc.address()).to_readable(),
         side: side.to_owned(),
         serial,
+        texauth_serial,
         price_mei_per_hacp,
         lot_hacp,
         total_hacp,
@@ -239,6 +250,7 @@ pub fn create_tex_order(
     prikey: &str,
     side: &str,
     serial: u64,
+    texauth_serial: u64,
     price_mei_per_hacp: u64,
     total_hacp: u64,
     maker_balance_at_signing: u64,
@@ -252,8 +264,11 @@ pub fn create_tex_order(
     if side != TEX_SIDE_SELL_HACP && side != TEX_SIDE_BUY_HACP {
         return errf!("side must be sell_hacp or buy_hacp");
     }
-    if serial == 0 || price_mei_per_hacp == 0 || total_hacp == 0 {
-        return errf!("serial, price and total must be positive");
+    if serial == 0 || texauth_serial == 0 || price_mei_per_hacp == 0 || total_hacp == 0 {
+        return errf!("serial, TEXAUTH serial, price and total must be positive");
+    }
+    if serial == texauth_serial {
+        return errf!("TEXAUTH serial must differ from the traded asset serial");
     }
     if expire_height == 0 {
         return errf!("expire_height is required");
@@ -266,6 +281,7 @@ pub fn create_tex_order(
             &acc,
             &side,
             serial,
+            texauth_serial,
             price_mei_per_hacp,
             denom,
             total_hacp,
@@ -295,6 +311,7 @@ pub fn create_tex_order(
         address: Address::from(*acc.address()).to_readable(),
         side,
         serial,
+        texauth_serial,
         price_mei_per_hacp,
         total_hacp,
         maker_balance_at_signing,
@@ -312,6 +329,7 @@ pub fn create_tex_take(
     order_id: u64,
     take_nonce: u64,
     serial: u64,
+    texauth_serial: u64,
     price_mei_per_hacp: u64,
     hacp_amount: u64,
     fee_bps: u32,
@@ -326,10 +344,16 @@ pub fn create_tex_take(
     if order_id == 0
         || take_nonce == 0
         || serial == 0
+        || texauth_serial == 0
         || price_mei_per_hacp == 0
         || hacp_amount == 0
     {
-        return errf!("order id, take nonce, serial, price and amount must be positive");
+        return errf!(
+            "order id, take nonce, serial, TEXAUTH serial, price and amount must be positive"
+        );
+    }
+    if serial == texauth_serial {
+        return errf!("TEXAUTH serial must differ from the traded asset serial");
     }
     // Bind the deterministic taker signature to one backend order without
     // changing its effective expiry. The first condition remains stricter;
@@ -358,6 +382,10 @@ pub fn create_tex_take(
     act.add_cell(Box::new(CellCondHeightAtMost::new(replay_marker_height)))?;
     act.add_cell(Box::new(CellCondHeightAtMost::new(nonce_marker_height)))?;
     act.add_cell(Box::new(CellCondChainIdEq::new(chain_id)))?;
+    act.add_cell(Box::new(CellTrsAssetPay::new(tex_asset(
+        texauth_serial,
+        1,
+    )?)))?;
     if order_side == TEX_SIDE_SELL_HACP {
         let pay_mei = trade_mei
             .checked_add(taker_fee_mei)
@@ -388,6 +416,7 @@ pub fn create_tex_take(
         &acc,
         taker_side,
         serial,
+        texauth_serial,
         price_mei_per_hacp,
         hacp_amount,
         hacp_amount,
@@ -413,6 +442,7 @@ mod tex_sdk_tests {
             &acc,
             "sell_hacp",
             1025,
+            1026,
             300_000_000,
             10,
             100,
@@ -430,7 +460,7 @@ mod tex_sdk_tests {
             act.addr.to_readable(),
             Address::from(*acc.address()).to_readable()
         );
-        assert_eq!(act.cells.length(), 5);
+        assert_eq!(act.cells.length(), 6);
         let hash = tex_sign_hash(&act);
         assert_eq!(hash.to_hex(), bundle.sign_hash);
         assert!(verify_signature(&hash, &act.addr, &act.sign));
@@ -440,6 +470,7 @@ mod tex_sdk_tests {
             "sdk_tex_maker",
             "sell_hacp",
             1025,
+            1026,
             300_000_000,
             100,
             500,
@@ -491,6 +522,7 @@ mod tex_sdk_tests {
             41,
             9001,
             1025,
+            1026,
             300_000_000,
             10,
             25,
@@ -504,6 +536,7 @@ mod tex_sdk_tests {
             41,
             9001,
             1025,
+            1026,
             300_000_000,
             10,
             0,
@@ -523,6 +556,7 @@ mod tex_sdk_tests {
             41,
             9001,
             1025,
+            1026,
             300_000_000,
             10,
             25,
@@ -536,6 +570,7 @@ mod tex_sdk_tests {
             42,
             9001,
             1025,
+            1026,
             300_000_000,
             10,
             25,
@@ -555,6 +590,7 @@ mod tex_sdk_tests {
             41,
             9001,
             1025,
+            1026,
             300_000_000,
             10,
             25,
@@ -568,6 +604,7 @@ mod tex_sdk_tests {
             41,
             9002,
             1025,
+            1026,
             300_000_000,
             10,
             25,
@@ -587,6 +624,7 @@ mod tex_sdk_tests {
             41,
             (1_u64 << 40) - 765_900,
             1025,
+            1026,
             300_000_000,
             10,
             25,

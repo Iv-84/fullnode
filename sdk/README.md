@@ -99,7 +99,7 @@ surface** — only the operation table below grows.
 
 | Layer | Export | Signature | Description |
 |---|---|---|---|
-| WASM | `sdk_transport_version()` | `() -> number` | Transport version of the JSON envelope semantics (currently `9`). |
+| WASM | `sdk_transport_version()` | `() -> number` | Transport version of the JSON envelope semantics (currently `10`). |
 | WASM | `sdk_invoke_json(operation_id, payload)` | `(number, Uint8Array) -> string` | UTF-8 JSON request → JSON envelope string. `operation_id` is an `OP_*` constant (table below). |
 | JS (node) | `create_hacash_sdk({ target: "auto"\|"node"\|"web", wasm? })` | `() -> Promise<{ sdk_invoke_json, sdk_transport_version }>` | Loads the matching backend: node auto-imports `../nodejs/`, web fetches `../web/` (optionally `{ wasm }` for a custom URL/Response). |
 | JS (web) | `default __wbg_init(module_or_path?)`, `initSync(module)` | — | wasm-bindgen boilerplate for embedding; normal users go through `create_hacash_sdk`. |
@@ -124,7 +124,7 @@ order, `1` = `unknown_operation`, `0` = unknown code). `detail` is a JSON
 string field (empty when absent); when present its contents carry structured
 fields such as `action_index`, `byte_offset`, `expected`, and `actual`.
 
-### 3. Operations (`OP_*` registry, transport version 9)
+### 3. Operations (`OP_*` registry, transport version 10)
 
 | ID | Operation | Request fields | Response schema |
 |---|---|---|---|
@@ -153,6 +153,9 @@ fields such as `action_index`, `byte_offset`, `expected`, and `actual`.
 | 23 | `vm.decode_call` | `action` (raw wire hex of a `contract_main_call`, e.g. `tx.decode`'s `actions[].raw`) | `vm-call@1`: `kind`, `name`, `scope`, `marks`, `marks_valid`, `codeconf`, `code_type`, `code_type_name`, `codes_len`, `codes_hash`, `codes_preview` |
 | 24 | `action.describe` | `action` (raw wire hex of any action), `describe?` | `action-desc@2`: single-action description with independently switchable `description` / `json` / `code` facets |
 | 25 | `vm.code` | `codes` (hex), `code_type` (0=bytecode, 1=ir_node), `format?` (`assembly` for bytecode; `fitsh`/`tree` for ir), `sourcemap?`, `limit?` (default 8000), `offset?` | `vm-code@1`: `code_type`, `code_type_name`, `codes_len`, `codes_hash`, `format`, `lines`, `text`, `truncated`, `limit`, `offset` |
+| 26 | `tex.create_order` | `address`, `side`, `serial`, `texauth_serial`, `price_mei_per_hacp`, `total_hacp`, `maker_balance_at_signing`, `denominations`, `expire_height`, `chain_id`, `fee_bps` | `tex-order@1`: denomination bundles containing `action_hex`, `sign_hash`, and `spend_floor` |
+| 27 | `tex.create_take` | `address`, `order_side`, `order_id`, `take_nonce`, `serial`, `texauth_serial`, `price_mei_per_hacp`, `hacp_amount`, `fee_bps`, `expire_height`, `chain_id` | `tex-prepared-action@1`: unsigned placeholder action plus the digest for the external wallet vault |
+| 28 | `tex.attach_signature` | `action`, `public_key`, `signature` | `tex-signed-action@1`: verified kind-22 action with its embedded signature attached |
 
 Optional fields are exactly as written (`?`); unknown or duplicated request
 fields are rejected with `unknown_field`/`parse_failed`. The shared signing
@@ -268,7 +271,7 @@ node ./sdk/tests/raw_build_test.mjs   # after ./sdk/pack.sh
 
 Implemented: the JSON dispatcher, transaction build/decode/encode/inspect,
 signature preparation/attachment/verification/reporting, account/amount/message
-and policy operations, diamond lookup, fee estimation, action descriptions, VM
+and policy operations, externally signed TEX order/take preparation, diamond lookup, fee estimation, action descriptions, VM
 call decoding and bytecode/IR display, plus the nodejs/web/page wasm targets.
 The SDK's current wasm output is about 0.30MB gzip and stays below the page
 bundle budget.

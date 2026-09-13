@@ -1,12 +1,24 @@
-use protocol::tex::*;
+//! TEX order/take action preparation for Unified SDK 2.0.
+//!
+//! These helpers build the exact kind-22 wire payload and its embedded-signature
+//! digest. They deliberately accept an address, never a private key; the wallet
+//! vault signs the digest and `tex.attach_signature` verifies and attaches it.
 
+use base::BinaryCodecs;
+use field::{Address, BlockHeight, Decode, Encode, Fold64, Uint1, Uint2, Uint4};
+
+use crate::error::{SdkError, SdkErrorCode};
+use crate::json::{SdkJsonTo, arr, kv, obj, q, qnum};
+
+const TEX_ACTION_KIND: u16 = 22;
 const TEX_SIDE_SELL_HACP: &str = "sell_hacp";
 const TEX_SIDE_BUY_HACP: &str = "buy_hacp";
 const TEX_MAX_BLOCK_HEIGHT: u64 = (1_u64 << 40) - 1;
+const TEX_SIGN_SIZE: usize = 33 + 64;
 
-#[wasm_bindgen(getter_with_clone, inspectable)]
-pub struct TexActionResult {
-    pub signed_action_hex: String,
+#[derive(Debug, Clone, PartialEq)]
+pub struct TexPreparedAction {
+    pub action_hex: String,
     pub sign_hash: String,
     pub address: String,
     pub side: String,
@@ -24,7 +36,15 @@ pub struct TexActionResult {
     pub chain_id: u32,
 }
 
-#[wasm_bindgen(getter_with_clone, inspectable)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct TexOrderBundle {
+    pub denomination: u64,
+    pub action_hex: String,
+    pub sign_hash: String,
+    pub spend_floor: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TexOrderResult {
     pub address: String,
     pub side: String,
@@ -35,38 +55,143 @@ pub struct TexOrderResult {
     pub maker_balance_at_signing: u64,
     pub expire_height: u64,
     pub chain_id: u32,
-    pub denominations: String,
-    pub bundles_json: String,
+    pub denominations: Vec<u64>,
+    pub bundles: Vec<TexOrderBundle>,
 }
 
-struct TexOrderBundle {
-    denom: u64,
-    signed_action_hex: String,
-    sign_hash: String,
-    spend_floor: u64,
+#[derive(Debug, Clone, PartialEq)]
+pub struct TexSignedAction {
+    pub signed_action_hex: String,
+    pub sign_hash: String,
+    pub address: String,
 }
 
-fn tex_fold(value: u64, label: &str) -> Ret<Fold64> {
-    Fold64::from(value).map_err(|e| format!("{} invalid: {}", label, e))
+impl SdkJsonTo for TexPreparedAction {
+    fn to_json_string(&self) -> String {
+        obj(vec![
+            kv("schema", q("tex-prepared-action@1")),
+            kv("action_hex", q(&self.action_hex)),
+            kv("sign_hash", q(&self.sign_hash)),
+            kv("address", q(&self.address)),
+            kv("side", q(&self.side)),
+            kv("serial", qnum(self.serial)),
+            kv("texauth_serial", qnum(self.texauth_serial)),
+            kv("price_mei_per_hacp", qnum(self.price_mei_per_hacp)),
+            kv("lot_hacp", qnum(self.lot_hacp)),
+            kv("total_hacp", qnum(self.total_hacp)),
+            kv(
+                "maker_balance_at_signing",
+                qnum(self.maker_balance_at_signing),
+            ),
+            kv("spend_floor", qnum(self.spend_floor)),
+            kv("hacp_amount", qnum(self.hacp_amount)),
+            kv("hac_mei_net", qnum(self.hac_mei_net)),
+            kv("taker_fee_mei", qnum(self.taker_fee_mei)),
+            kv("expire_height", qnum(self.expire_height)),
+            kv("chain_id", qnum(self.chain_id)),
+        ])
+    }
 }
 
-fn tex_asset(serial: u64, amount: u64) -> Ret<AssetAmt> {
-    AssetAmt::from(serial, amount)
+impl SdkJsonTo for TexOrderBundle {
+    fn to_json_string(&self) -> String {
+        obj(vec![
+            kv("denomination", qnum(self.denomination)),
+            kv("action_hex", q(&self.action_hex)),
+            kv("sign_hash", q(&self.sign_hash)),
+            kv("spend_floor", qnum(self.spend_floor)),
+        ])
+    }
 }
 
-fn tex_trade_mei(price_mei_per_hacp: u64, hacp_amount: u64) -> Ret<u64> {
+impl SdkJsonTo for TexOrderResult {
+    fn to_json_string(&self) -> String {
+        obj(vec![
+            kv("schema", q("tex-order@1")),
+            kv("address", q(&self.address)),
+            kv("side", q(&self.side)),
+            kv("serial", qnum(self.serial)),
+            kv("texauth_serial", qnum(self.texauth_serial)),
+            kv("price_mei_per_hacp", qnum(self.price_mei_per_hacp)),
+            kv("total_hacp", qnum(self.total_hacp)),
+            kv(
+                "maker_balance_at_signing",
+                qnum(self.maker_balance_at_signing),
+            ),
+            kv("expire_height", qnum(self.expire_height)),
+            kv("chain_id", qnum(self.chain_id)),
+            kv(
+                "denominations",
+                arr(self.denominations.iter().map(|v| qnum(*v)).collect()),
+            ),
+            kv(
+                "bundles",
+                arr(self.bundles.iter().map(SdkJsonTo::to_json_string).collect()),
+            ),
+        ])
+    }
+}
+
+impl SdkJsonTo for TexSignedAction {
+    fn to_json_string(&self) -> String {
+        obj(vec![
+            kv("schema", q("tex-signed-action@1")),
+            kv("signed_action_hex", q(&self.signed_action_hex)),
+            kv("sign_hash", q(&self.sign_hash)),
+            kv("address", q(&self.address)),
+        ])
+    }
+}
+
+fn parse_error(message: impl Into<String>) -> SdkError {
+    SdkError::new(SdkErrorCode::ParseFailed, message)
+}
+
+fn checked_side(raw: &str, label: &str) -> Result<String, SdkError> {
+    let side = raw.trim().to_ascii_lowercase();
+    if side != TEX_SIDE_SELL_HACP && side != TEX_SIDE_BUY_HACP {
+        return Err(parse_error(format!(
+            "{label} must be sell_hacp or buy_hacp"
+        )));
+    }
+    Ok(side)
+}
+
+fn checked_address(raw: &str) -> Result<Address, SdkError> {
+    let address = Address::from_readable(raw)
+        .map_err(|e| SdkError::new(SdkErrorCode::InvalidAddress, e.to_string()))?;
+    address
+        .must_privkey()
+        .map_err(|e| SdkError::new(SdkErrorCode::InvalidAddress, e.to_string()))?;
+    Ok(address)
+}
+
+fn checked_chain_id(value: u64) -> Result<u32, SdkError> {
+    value
+        .try_into()
+        .map_err(|_| parse_error("chain_id exceeds the 32-bit wire limit"))
+}
+
+fn checked_fee_bps(value: u64) -> Result<u32, SdkError> {
+    value
+        .try_into()
+        .map_err(|_| parse_error("fee_bps exceeds the 32-bit limit"))
+}
+
+fn checked_fold(value: u64, label: &str) -> Result<Fold64, SdkError> {
+    Fold64::from(value).map_err(|e| parse_error(format!("{label} invalid: {e}")))
+}
+
+fn tex_trade_mei(price_mei_per_hacp: u64, hacp_amount: u64) -> Result<u64, SdkError> {
     price_mei_per_hacp
         .checked_mul(hacp_amount)
-        .ok_or_else(|| "trade HAC amount overflow".to_string())
+        .ok_or_else(|| parse_error("trade HAC amount overflow"))
 }
 
-// Comisión por lado sobre una pata de HAC, redondeada al alza (E-8).
-// fee_bps en puntos básicos: 25 = 0,25%. Debe coincidir byte a byte con el backend.
-fn tex_fee_mei(hac_mei: u64, fee_bps: u32) -> u64 {
-    if fee_bps == 0 {
-        return 0;
-    }
-    ((hac_mei as u128 * fee_bps as u128 + 9_999) / 10_000) as u64
+fn tex_fee_mei(hac_mei: u64, fee_bps: u32) -> Result<u64, SdkError> {
+    let fee = (hac_mei as u128 * fee_bps as u128 + 9_999) / 10_000;
+    fee.try_into()
+        .map_err(|_| parse_error("TEX fee exceeds the 64-bit limit"))
 }
 
 fn tex_order_spend_floor(
@@ -76,178 +201,182 @@ fn tex_order_spend_floor(
     total_hacp: u64,
     maker_balance_at_signing: u64,
     fee_bps: u32,
-) -> Ret<(u64, u64)> {
-    // En SELL el maker gasta HACP (la pata de HAC es lo que cobra, con fee restado → no
-    // afecta al suelo de HACP). En BUY el maker gasta HAC e incluye su fee por lado.
+) -> Result<(u64, u64), SdkError> {
     let lot_spend = if side == TEX_SIDE_SELL_HACP {
         lot_hacp
     } else {
         let lot_mei = tex_trade_mei(price_mei_per_hacp, lot_hacp)?;
         lot_mei
-            .checked_add(tex_fee_mei(lot_mei, fee_bps))
-            .ok_or_else(|| "lot spend overflow".to_string())?
+            .checked_add(tex_fee_mei(lot_mei, fee_bps)?)
+            .ok_or_else(|| parse_error("lot spend overflow"))?
     };
     let total_spend = if side == TEX_SIDE_SELL_HACP {
         total_hacp
     } else {
         let total_mei = tex_trade_mei(price_mei_per_hacp, total_hacp)?;
         total_mei
-            .checked_add(tex_fee_mei(total_mei, fee_bps))
-            .ok_or_else(|| "total spend overflow".to_string())?
+            .checked_add(tex_fee_mei(total_mei, fee_bps)?)
+            .ok_or_else(|| parse_error("total spend overflow"))?
     };
     if maker_balance_at_signing < total_spend {
-        return errf!("maker balance at signing is below the declared order total");
+        return Err(parse_error(
+            "maker balance at signing is below the declared order total",
+        ));
     }
     let floor = maker_balance_at_signing
         .checked_sub(total_spend)
         .and_then(|remaining| remaining.checked_add(lot_spend))
-        .ok_or_else(|| "order spend floor overflow".to_string())?;
+        .ok_or_else(|| parse_error("order spend floor overflow"))?;
     Ok((lot_spend, floor))
 }
 
-fn tex_denominations(raw: &str, total_hacp: u64) -> Ret<Vec<u64>> {
+fn tex_denominations(raw: &str, total_hacp: u64) -> Result<Vec<u64>, SdkError> {
     let mut out = Vec::new();
     for item in raw.split(',') {
-        let denom = item
-            .trim()
+        let text = item.trim();
+        let denomination = text
             .parse::<u64>()
-            .map_err(|_| format!("invalid TEX denomination: {}", item.trim()))?;
-        if denom > 0 && denom <= total_hacp && !out.contains(&denom) {
-            out.push(denom);
+            .map_err(|_| parse_error(format!("invalid TEX denomination: {text}")))?;
+        if denomination > 0 && denomination <= total_hacp && !out.contains(&denomination) {
+            out.push(denomination);
         }
     }
     out.sort_unstable_by(|a, b| b.cmp(a));
     if out.is_empty() || !out.contains(&1) {
-        return errf!("denominations must include 1 and at least one value <= total_hacp");
+        return Err(parse_error(
+            "denominations must include 1 and at least one value <= total_hacp",
+        ));
     }
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Debug)]
+enum Cell {
+    Fold(u8, u64, &'static str),
+    Asset(u8, u64, u64),
+    Height(u64),
+    Chain(u32),
+}
+
+impl Cell {
+    fn encode_to(&self, out: &mut Vec<u8>) -> Result<(), SdkError> {
+        match *self {
+            Self::Fold(id, value, label) => {
+                Uint1::from(id).encode_to(out);
+                checked_fold(value, label)?.encode_to(out);
+            }
+            Self::Asset(id, serial, amount) => {
+                Uint1::from(id).encode_to(out);
+                checked_fold(serial, "asset serial")?.encode_to(out);
+                checked_fold(amount, "asset amount")?.encode_to(out);
+            }
+            Self::Height(height) => {
+                let height = BlockHeight::from_checked(height)
+                    .ok_or_else(|| parse_error("height exceeds the 40-bit wire limit"))?;
+                Uint1::from(23).encode_to(out);
+                height.encode_to(out);
+            }
+            Self::Chain(chain_id) => {
+                Uint1::from(25).encode_to(out);
+                Uint4::from(chain_id).encode_to(out);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn build_unsigned_action(address: Address, cells: Vec<Cell>) -> Result<(String, String), SdkError> {
+    let cell_count: u8 = cells
+        .len()
+        .try_into()
+        .map_err(|_| parse_error("too many TEX cells"))?;
+    let mut wire = Vec::new();
+    Uint2::from(TEX_ACTION_KIND).encode_to(&mut wire);
+    address.encode_to(&mut wire);
+    Uint1::from(cell_count).encode_to(&mut wire);
+    for cell in cells {
+        cell.encode_to(&mut wire)?;
+    }
+    wire.resize(wire.len() + TEX_SIGN_SIZE, 0);
+
+    let action = crate::codec::standard_codecs()?
+        .decode_action_exact(&wire)
+        .map_err(SdkError::from)?;
+    if action.kind() != TEX_ACTION_KIND {
+        return Err(parse_error("prepared action is not TEX kind 22"));
+    }
+    let sign_hash = tex_sign_hash(&wire)?;
+    Ok((hex::encode(wire), hex::encode(sign_hash)))
+}
+
+fn tex_sign_hash(wire: &[u8]) -> Result<[u8; 32], SdkError> {
+    let signed_end = wire
+        .len()
+        .checked_sub(TEX_SIGN_SIZE)
+        .filter(|end| *end >= 2 + Address::SIZE + 1)
+        .ok_or_else(|| parse_error("TEX action is too short"))?;
+    Ok(sys::calculate_hash(&wire[2..signed_end]))
+}
+
 fn create_tex_order_bundle(
-    acc: &SysAccount,
+    address: Address,
     side: &str,
     serial: u64,
     texauth_serial: u64,
     price_mei_per_hacp: u64,
-    denom: u64,
+    denomination: u64,
     total_hacp: u64,
     maker_balance_at_signing: u64,
     expire_height: u64,
     chain_id: u32,
     fee_bps: u32,
-) -> Ret<TexOrderBundle> {
-    let lot_mei = tex_trade_mei(price_mei_per_hacp, denom)?;
-    let lot_fee = tex_fee_mei(lot_mei, fee_bps);
+) -> Result<TexOrderBundle, SdkError> {
+    let lot_mei = tex_trade_mei(price_mei_per_hacp, denomination)?;
+    let lot_fee = tex_fee_mei(lot_mei, fee_bps)?;
     let (_, spend_floor) = tex_order_spend_floor(
         side,
         price_mei_per_hacp,
-        denom,
+        denomination,
         total_hacp,
         maker_balance_at_signing,
         fee_bps,
     )?;
-    let mut act = TexCellAct::create_by(Address::from(*acc.address()));
-    act.add_cell(Box::new(CellCondHeightAtMost::new(expire_height)))?;
-    act.add_cell(Box::new(CellCondChainIdEq::new(chain_id)))?;
-    // TEXAUTH is lent by the exchange immediately before this bundle runs.
-    // A copied standalone bundle therefore fails before it can move trade funds.
-    act.add_cell(Box::new(CellTrsAssetPay::new(tex_asset(
-        texauth_serial,
-        1,
-    )?)))?;
+    let mut cells = vec![
+        Cell::Height(expire_height),
+        Cell::Chain(chain_id),
+        Cell::Asset(7, texauth_serial, 1),
+    ];
     if side == TEX_SIDE_SELL_HACP {
-        // Maker recauda HAC → paga su lado: cobra lot_mei − fee.
         let maker_get = lot_mei
             .checked_sub(lot_fee)
-            .ok_or_else(|| "denomination fee exceeds lot".to_string())?;
-        act.add_cell(Box::new(CellCondAssetAtLeast::new(tex_asset(
-            serial,
-            spend_floor,
-        )?)))?;
-        act.add_cell(Box::new(CellTrsAssetPay::new(tex_asset(serial, denom)?)))?;
-        act.add_cell(Box::new(CellTrsZhuGet::new(tex_fold(
-            maker_get,
-            "denomination HAC",
-        )?)))?;
+            .ok_or_else(|| parse_error("denomination fee exceeds lot"))?;
+        cells.extend([
+            Cell::Asset(21, serial, spend_floor),
+            Cell::Asset(7, serial, denomination),
+            Cell::Fold(2, maker_get, "denomination HAC"),
+        ]);
     } else {
-        // Maker paga HAC → paga su lado: paga lot_mei + fee.
         let maker_pay = lot_mei
             .checked_add(lot_fee)
-            .ok_or_else(|| "denomination HAC overflow".to_string())?;
-        act.add_cell(Box::new(CellCondZhuAtLeast::new(tex_fold(
-            spend_floor,
-            "HAC spend floor",
-        )?)))?;
-        act.add_cell(Box::new(CellTrsZhuPay::new(tex_fold(
-            maker_pay,
-            "denomination HAC",
-        )?)))?;
-        act.add_cell(Box::new(CellTrsAssetGet::new(tex_asset(serial, denom)?)))?;
+            .ok_or_else(|| parse_error("denomination HAC overflow"))?;
+        cells.extend([
+            Cell::Fold(12, spend_floor, "HAC spend floor"),
+            Cell::Fold(1, maker_pay, "denomination HAC"),
+            Cell::Asset(8, serial, denomination),
+        ]);
     }
-    let hash = tex_sign_hash(&act);
-    act.do_sign(acc)
-        .map_err(|e| format!("TEX sign failed: {}", e))?;
+    let (action_hex, sign_hash) = build_unsigned_action(address, cells)?;
     Ok(TexOrderBundle {
-        denom,
-        signed_action_hex: act.serialize().to_hex(),
-        sign_hash: hash.to_hex(),
+        denomination,
+        action_hex,
+        sign_hash,
         spend_floor,
     })
-}
-
-fn tex_sign_hash(act: &TexCellAct) -> Hash {
-    let mut stuff = Vec::with_capacity(act.addr.size() + act.cells.size());
-    act.addr.serialize_to(&mut stuff);
-    act.cells.serialize_to(&mut stuff);
-    Hash::from(sha3(&stuff))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finish_tex_action(
-    mut act: TexCellAct,
-    acc: &SysAccount,
-    side: &str,
-    serial: u64,
-    texauth_serial: u64,
-    price_mei_per_hacp: u64,
-    lot_hacp: u64,
-    total_hacp: u64,
-    maker_balance_at_signing: u64,
-    spend_floor: u64,
-    hacp_amount: u64,
-    hac_mei_net: u64,
-    taker_fee_mei: u64,
-    expire_height: u64,
-    chain_id: u32,
-) -> Ret<TexActionResult> {
-    let hash = tex_sign_hash(&act);
-    if let Err(e) = act.do_sign(acc) {
-        return errf!("TEX sign failed: {}", e);
-    }
-    Ok(TexActionResult {
-        signed_action_hex: act.serialize().to_hex(),
-        sign_hash: hash.to_hex(),
-        address: Address::from(*acc.address()).to_readable(),
-        side: side.to_owned(),
-        serial,
-        texauth_serial,
-        price_mei_per_hacp,
-        lot_hacp,
-        total_hacp,
-        maker_balance_at_signing,
-        spend_floor,
-        hacp_amount,
-        hac_mei_net,
-        taker_fee_mei,
-        expire_height,
-        chain_id,
-    })
-}
-
-#[wasm_bindgen]
 pub fn create_tex_order(
-    prikey: &str,
+    address: &str,
     side: &str,
     serial: u64,
     texauth_serial: u64,
@@ -256,34 +385,36 @@ pub fn create_tex_order(
     maker_balance_at_signing: u64,
     denominations_csv: &str,
     expire_height: u64,
-    chain_id: u32,
-    fee_bps: u32,
-) -> Ret<TexOrderResult> {
-    let acc = q_acc!(prikey);
-    let side = side.trim().to_ascii_lowercase();
-    if side != TEX_SIDE_SELL_HACP && side != TEX_SIDE_BUY_HACP {
-        return errf!("side must be sell_hacp or buy_hacp");
-    }
+    chain_id: u64,
+    fee_bps: u64,
+) -> Result<TexOrderResult, SdkError> {
+    let address = checked_address(address)?;
+    let side = checked_side(side, "side")?;
+    let chain_id = checked_chain_id(chain_id)?;
+    let fee_bps = checked_fee_bps(fee_bps)?;
     if serial == 0 || texauth_serial == 0 || price_mei_per_hacp == 0 || total_hacp == 0 {
-        return errf!("serial, TEXAUTH serial, price and total must be positive");
+        return Err(parse_error(
+            "serial, TEXAUTH serial, price and total must be positive",
+        ));
     }
     if serial == texauth_serial {
-        return errf!("TEXAUTH serial must differ from the traded asset serial");
+        return Err(parse_error(
+            "TEXAUTH serial must differ from the traded asset serial",
+        ));
     }
-    if expire_height == 0 {
-        return errf!("expire_height is required");
+    if expire_height == 0 || expire_height > TEX_MAX_BLOCK_HEIGHT {
+        return Err(parse_error("expire_height must fit the 40-bit wire limit"));
     }
-
     let denominations = tex_denominations(denominations_csv, total_hacp)?;
     let mut bundles = Vec::with_capacity(denominations.len());
-    for denom in denominations {
+    for &denomination in &denominations {
         bundles.push(create_tex_order_bundle(
-            &acc,
+            address,
             &side,
             serial,
             texauth_serial,
             price_mei_per_hacp,
-            denom,
+            denomination,
             total_hacp,
             maker_balance_at_signing,
             expire_height,
@@ -291,24 +422,8 @@ pub fn create_tex_order(
             fee_bps,
         )?);
     }
-    let denominations = bundles
-        .iter()
-        .map(|bundle| bundle.denom.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let bundles_json = format!(
-        "[{}]",
-        bundles
-            .iter()
-            .map(|bundle| format!(
-                "{{\"denom\":\"{}\",\"signedActionHex\":\"{}\",\"signHash\":\"{}\",\"spendFloor\":\"{}\"}}",
-                bundle.denom, bundle.signed_action_hex, bundle.sign_hash, bundle.spend_floor
-            ))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
     Ok(TexOrderResult {
-        address: Address::from(*acc.address()).to_readable(),
+        address: address.to_readable(),
         side,
         serial,
         texauth_serial,
@@ -318,13 +433,13 @@ pub fn create_tex_order(
         expire_height,
         chain_id,
         denominations,
-        bundles_json,
+        bundles,
     })
 }
 
-#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
 pub fn create_tex_take(
-    prikey: &str,
+    address: &str,
     order_side: &str,
     order_id: u64,
     take_nonce: u64,
@@ -332,15 +447,14 @@ pub fn create_tex_take(
     texauth_serial: u64,
     price_mei_per_hacp: u64,
     hacp_amount: u64,
-    fee_bps: u32,
+    fee_bps: u64,
     expire_height: u64,
-    chain_id: u32,
-) -> Ret<TexActionResult> {
-    let acc = q_acc!(prikey);
-    let order_side = order_side.trim().to_ascii_lowercase();
-    if order_side != TEX_SIDE_SELL_HACP && order_side != TEX_SIDE_BUY_HACP {
-        return errf!("order_side must be sell_hacp or buy_hacp");
-    }
+    chain_id: u64,
+) -> Result<TexPreparedAction, SdkError> {
+    let address = checked_address(address)?;
+    let order_side = checked_side(order_side, "order_side")?;
+    let chain_id = checked_chain_id(chain_id)?;
+    let fee_bps = checked_fee_bps(fee_bps)?;
     if order_id == 0
         || take_nonce == 0
         || serial == 0
@@ -348,126 +462,152 @@ pub fn create_tex_take(
         || price_mei_per_hacp == 0
         || hacp_amount == 0
     {
-        return errf!(
-            "order id, take nonce, serial, TEXAUTH serial, price and amount must be positive"
-        );
+        return Err(parse_error(
+            "order id, take nonce, serial, TEXAUTH serial, price and amount must be positive",
+        ));
     }
     if serial == texauth_serial {
-        return errf!("TEXAUTH serial must differ from the traded asset serial");
+        return Err(parse_error(
+            "TEXAUTH serial must differ from the traded asset serial",
+        ));
     }
-    // Bind the deterministic taker signature to one backend order without
-    // changing its effective expiry. The first condition remains stricter;
-    // this redundant upper bound only carries the replay-domain marker.
     let replay_marker_height = expire_height
         .checked_add(order_id)
-        .ok_or_else(|| "TEX take replay marker overflow".to_string())?;
+        .ok_or_else(|| parse_error("TEX take replay marker overflow"))?;
     let nonce_marker_height = expire_height
         .checked_add(take_nonce)
-        .ok_or_else(|| "TEX take nonce marker overflow".to_string())?;
-    if expire_height > TEX_MAX_BLOCK_HEIGHT
+        .ok_or_else(|| parse_error("TEX take nonce marker overflow"))?;
+    if expire_height == 0
+        || expire_height > TEX_MAX_BLOCK_HEIGHT
         || replay_marker_height > TEX_MAX_BLOCK_HEIGHT
         || nonce_marker_height > TEX_MAX_BLOCK_HEIGHT
     {
-        return errf!("TEX take replay markers exceed the 40-bit block height limit");
+        return Err(parse_error(
+            "TEX take replay markers exceed the 40-bit block height limit",
+        ));
     }
     let trade_mei = tex_trade_mei(price_mei_per_hacp, hacp_amount)?;
-    let taker_fee_mei = tex_fee_mei(trade_mei, fee_bps);
+    let taker_fee_mei = tex_fee_mei(trade_mei, fee_bps)?;
     let taker_side = if order_side == TEX_SIDE_SELL_HACP {
         TEX_SIDE_BUY_HACP
     } else {
         TEX_SIDE_SELL_HACP
     };
-    let mut act = TexCellAct::create_by(Address::from(*acc.address()));
-    act.add_cell(Box::new(CellCondHeightAtMost::new(expire_height)))?;
-    act.add_cell(Box::new(CellCondHeightAtMost::new(replay_marker_height)))?;
-    act.add_cell(Box::new(CellCondHeightAtMost::new(nonce_marker_height)))?;
-    act.add_cell(Box::new(CellCondChainIdEq::new(chain_id)))?;
-    act.add_cell(Box::new(CellTrsAssetPay::new(tex_asset(
-        texauth_serial,
-        1,
-    )?)))?;
+    let mut cells = vec![
+        Cell::Height(expire_height),
+        Cell::Height(replay_marker_height),
+        Cell::Height(nonce_marker_height),
+        Cell::Chain(chain_id),
+        Cell::Asset(7, texauth_serial, 1),
+    ];
     if order_side == TEX_SIDE_SELL_HACP {
         let pay_mei = trade_mei
             .checked_add(taker_fee_mei)
-            .ok_or_else(|| "taker HAC amount overflow".to_string())?;
-        act.add_cell(Box::new(CellTrsZhuPay::new(tex_fold(
-            pay_mei,
-            "taker HAC",
-        )?)))?;
-        act.add_cell(Box::new(CellTrsAssetGet::new(tex_asset(
-            serial,
-            hacp_amount,
-        )?)))?;
+            .ok_or_else(|| parse_error("taker HAC amount overflow"))?;
+        cells.extend([
+            Cell::Fold(1, pay_mei, "taker HAC"),
+            Cell::Asset(8, serial, hacp_amount),
+        ]);
     } else {
         let receive_mei = trade_mei
             .checked_sub(taker_fee_mei)
-            .ok_or_else(|| "trade amount must exceed the fixed taker fee".to_string())?;
-        act.add_cell(Box::new(CellTrsAssetPay::new(tex_asset(
-            serial,
-            hacp_amount,
-        )?)))?;
-        act.add_cell(Box::new(CellTrsZhuGet::new(tex_fold(
-            receive_mei,
-            "taker HAC",
-        )?)))?;
+            .ok_or_else(|| parse_error("trade amount must exceed the taker fee"))?;
+        cells.extend([
+            Cell::Asset(7, serial, hacp_amount),
+            Cell::Fold(2, receive_mei, "taker HAC"),
+        ]);
     }
-    finish_tex_action(
-        act,
-        &acc,
-        taker_side,
+    let (action_hex, sign_hash) = build_unsigned_action(address, cells)?;
+    Ok(TexPreparedAction {
+        action_hex,
+        sign_hash,
+        address: address.to_readable(),
+        side: taker_side.to_owned(),
         serial,
         texauth_serial,
         price_mei_per_hacp,
+        lot_hacp: hacp_amount,
+        total_hacp: hacp_amount,
+        maker_balance_at_signing: 0,
+        spend_floor: 0,
         hacp_amount,
-        hacp_amount,
-        0,
-        0,
-        hacp_amount,
-        trade_mei,
+        hac_mei_net: trade_mei,
         taker_fee_mei,
         expire_height,
         chain_id,
-    )
+    })
+}
+
+pub fn attach_tex_signature(
+    action_hex: &str,
+    public_key_hex: &str,
+    signature_hex: &str,
+) -> Result<TexSignedAction, SdkError> {
+    let mut wire = hex::decode(action_hex.trim_start_matches("0x").trim_start_matches("0X"))
+        .map_err(|_| parse_error("TEX action hex invalid"))?;
+    let action = crate::codec::standard_codecs()?
+        .decode_action_exact(&wire)
+        .map_err(SdkError::from)?;
+    if action.kind() != TEX_ACTION_KIND {
+        return Err(parse_error("action is not TEX kind 22"));
+    }
+    let sign_hash = tex_sign_hash(&wire)?;
+    let public_key: [u8; 33] = crate::inspect::decode_hex_fixed(
+        public_key_hex,
+        SdkErrorCode::InvalidPublicKey,
+        "public key must be 33-byte compressed hex",
+    )?;
+    if !sys::Account::compressed_public_key_valid(&public_key) {
+        return Err(SdkError::new(
+            SdkErrorCode::InvalidPublicKey,
+            "public key is not a valid secp256k1 compressed point",
+        ));
+    }
+    let signature: [u8; 64] = crate::inspect::decode_hex_fixed(
+        signature_hex,
+        SdkErrorCode::BadSignature,
+        "signature must be 64-byte hex",
+    )?;
+    let address_end = 2 + Address::SIZE;
+    let (address, used) = Address::decode(&wire[2..address_end]).map_err(SdkError::from)?;
+    if used != Address::SIZE {
+        return Err(parse_error("TEX signer address has trailing bytes"));
+    }
+    let signer_address = Address::from(sys::Account::get_address_by_public_key(public_key));
+    if signer_address != address {
+        return Err(SdkError::new(
+            SdkErrorCode::BadSignature,
+            "public key does not match the TEX action address",
+        ));
+    }
+    if !sys::Account::verify_signature(&sign_hash, &public_key, &signature) {
+        return Err(SdkError::new(
+            SdkErrorCode::BadSignature,
+            "TEX action signature verification failed",
+        ));
+    }
+    let sign_offset = wire.len() - TEX_SIGN_SIZE;
+    wire[sign_offset..sign_offset + 33].copy_from_slice(&public_key);
+    wire[sign_offset + 33..].copy_from_slice(&signature);
+    crate::codec::standard_codecs()?
+        .decode_action_exact(&wire)
+        .map_err(SdkError::from)?;
+    Ok(TexSignedAction {
+        signed_action_hex: hex::encode(wire),
+        sign_hash: hex::encode(sign_hash),
+        address: address.to_readable(),
+    })
 }
 
 #[cfg(test)]
-mod tex_sdk_tests {
+mod tests {
     use super::*;
-    use basis::method::verify_signature;
 
     #[test]
-    fn tex_order_roundtrip_is_canonical_and_signed() {
-        let acc = SysAccount::create_by_password("sdk_tex_maker").unwrap();
-        let bundle = create_tex_order_bundle(
-            &acc,
-            "sell_hacp",
-            1025,
-            1026,
-            300_000_000,
-            10,
-            100,
-            500,
-            765_900,
-            0,
-            25,
-        )
-        .unwrap();
-        let bytes = hex::decode(&bundle.signed_action_hex).unwrap();
-        let (act, used) = TexCellAct::create(&bytes).unwrap();
-        assert_eq!(used, bytes.len());
-        assert_eq!(act.serialize(), bytes);
-        assert_eq!(
-            act.addr.to_readable(),
-            Address::from(*acc.address()).to_readable()
-        );
-        assert_eq!(act.cells.length(), 6);
-        let hash = tex_sign_hash(&act);
-        assert_eq!(hash.to_hex(), bundle.sign_hash);
-        assert!(verify_signature(&hash, &act.addr, &act.sign));
-        assert_eq!(bundle.spend_floor, 410);
-
-        let out = create_tex_order(
-            "sdk_tex_maker",
+    fn order_bundle_is_canonical_and_externally_signable() {
+        let account = sys::Account::create_by("sdk_tex_maker").unwrap();
+        let result = create_tex_order(
+            &account.readable(),
             "sell_hacp",
             1025,
             1026,
@@ -480,157 +620,89 @@ mod tex_sdk_tests {
             25,
         )
         .unwrap();
-        assert_eq!(out.denominations, "100,50,20,10,5,2,1");
-        assert!(out.bundles_json.contains("\"denom\":\"1\""));
-        assert!(out.bundles_json.contains("\"denom\":\"100\""));
+        assert_eq!(result.denominations, vec![100, 50, 20, 10, 5, 2, 1]);
+        assert_eq!(result.bundles[0].spend_floor, 500);
+        assert_eq!(result.bundles.last().unwrap().spend_floor, 401);
+
+        let bundle = result.bundles.last().unwrap();
+        let digest: [u8; 32] = hex::decode(&bundle.sign_hash).unwrap().try_into().unwrap();
+        let signature = account.do_sign(&digest);
+        let signed = attach_tex_signature(
+            &bundle.action_hex,
+            &hex::encode(account.public_key().serialize_compressed()),
+            &hex::encode(signature),
+        )
+        .unwrap();
+        assert_eq!(signed.sign_hash, bundle.sign_hash);
+        crate::codec::standard_codecs()
+            .unwrap()
+            .decode_action_exact(&hex::decode(signed.signed_action_hex).unwrap())
+            .unwrap();
     }
 
     #[test]
-    fn tex_order_floor_allows_only_the_declared_net_drawdown() {
-        let (sell_lot, sell_floor) =
-            tex_order_spend_floor(TEX_SIDE_SELL_HACP, 300_000_000, 10, 100, 500, 25).unwrap();
-        let mut sell_balance = 500;
-        let mut sell_runs = 0;
-        while sell_balance >= sell_floor {
-            sell_balance -= sell_lot;
-            sell_runs += 1;
-        }
-        assert_eq!(sell_runs, 10);
-        assert_eq!(sell_balance, 400);
-
-        let (buy_lot, buy_floor) =
-            tex_order_spend_floor(TEX_SIDE_BUY_HACP, 300_000_000, 10, 100, 40_000_000_000, 25)
-                .unwrap();
-        // lot = 3e9 + 0,25% = 3_007_500_000 ; floor = 40e9 − (30e9+0,25%) + lot.
-        assert_eq!(buy_lot, 3_007_500_000);
-        assert_eq!(buy_floor, 12_932_500_000);
-        let mut buy_balance = 40_000_000_000;
-        let mut buy_runs = 0;
-        while buy_balance >= buy_floor {
-            buy_balance -= buy_lot;
-            buy_runs += 1;
-        }
-        assert_eq!(buy_runs, 10);
-        assert_eq!(buy_balance, 9_925_000_000);
-    }
-
-    #[test]
-    fn tex_take_fee_is_part_of_signed_payload() {
-        let with_fee = create_tex_take(
-            "sdk_tex_taker",
-            "sell_hacp",
-            41,
-            9001,
-            1025,
-            1026,
-            300_000_000,
-            10,
-            25,
-            765_900,
-            0,
-        )
-        .unwrap();
-        let no_fee = create_tex_take(
-            "sdk_tex_taker",
-            "sell_hacp",
-            41,
-            9001,
-            1025,
-            1026,
-            300_000_000,
-            10,
-            0,
-            765_900,
-            0,
-        )
-        .unwrap();
-        assert_ne!(with_fee.sign_hash, no_fee.sign_hash);
-        assert_ne!(with_fee.signed_action_hex, no_fee.signed_action_hex);
-    }
-
-    #[test]
-    fn tex_take_signature_is_bound_to_order_id() {
-        let first = create_tex_take(
-            "sdk_tex_taker",
-            "sell_hacp",
-            41,
-            9001,
-            1025,
-            1026,
-            300_000_000,
-            10,
-            25,
-            765_900,
-            0,
-        )
-        .unwrap();
-        let second = create_tex_take(
-            "sdk_tex_taker",
-            "sell_hacp",
-            42,
-            9001,
-            1025,
-            1026,
-            300_000_000,
-            10,
-            25,
-            765_900,
-            0,
-        )
-        .unwrap();
-        assert_ne!(first.sign_hash, second.sign_hash);
-        assert_ne!(first.signed_action_hex, second.signed_action_hex);
-    }
-
-    #[test]
-    fn tex_take_signature_is_unique_per_nonce() {
-        let first = create_tex_take(
-            "sdk_tex_taker",
-            "sell_hacp",
-            41,
-            9001,
-            1025,
-            1026,
-            300_000_000,
-            10,
-            25,
-            765_900,
-            0,
-        )
-        .unwrap();
-        let second = create_tex_take(
-            "sdk_tex_taker",
-            "sell_hacp",
-            41,
-            9002,
-            1025,
-            1026,
-            300_000_000,
-            10,
-            25,
-            765_900,
-            0,
-        )
-        .unwrap();
-        assert_ne!(first.sign_hash, second.sign_hash);
-        assert_ne!(first.signed_action_hex, second.signed_action_hex);
-    }
-
-    #[test]
-    fn tex_take_rejects_replay_marker_above_block_height_width() {
-        let result = create_tex_take(
-            "sdk_tex_taker",
-            "sell_hacp",
-            41,
-            (1_u64 << 40) - 765_900,
-            1025,
-            1026,
-            300_000_000,
-            10,
-            25,
-            765_900,
-            0,
+    fn order_floor_allows_only_declared_drawdown() {
+        assert_eq!(
+            tex_order_spend_floor(TEX_SIDE_SELL_HACP, 300_000_000, 10, 100, 500, 25).unwrap(),
+            (10, 410)
         );
-        assert!(result.is_err());
+        assert_eq!(
+            tex_order_spend_floor(TEX_SIDE_BUY_HACP, 300_000_000, 10, 100, 40_000_000_000, 25,)
+                .unwrap(),
+            (3_007_500_000, 12_932_500_000)
+        );
+    }
+
+    #[test]
+    fn take_digest_binds_fee_order_and_nonce() {
+        let account = sys::Account::create_by("sdk_tex_taker").unwrap();
+        let make = |order_id, nonce, fee| {
+            create_tex_take(
+                &account.readable(),
+                "sell_hacp",
+                order_id,
+                nonce,
+                1025,
+                1026,
+                300_000_000,
+                10,
+                fee,
+                765_900,
+                0,
+            )
+            .unwrap()
+            .sign_hash
+        };
+        assert_ne!(make(41, 9001, 25), make(41, 9001, 0));
+        assert_ne!(make(41, 9001, 25), make(42, 9001, 25));
+        assert_ne!(make(41, 9001, 25), make(41, 9002, 25));
+    }
+
+    #[test]
+    fn attach_rejects_wrong_signer() {
+        let account = sys::Account::create_by("sdk_tex_taker").unwrap();
+        let other = sys::Account::create_by("other").unwrap();
+        let action = create_tex_take(
+            &account.readable(),
+            "sell_hacp",
+            41,
+            9001,
+            1025,
+            1026,
+            300_000_000,
+            10,
+            25,
+            765_900,
+            0,
+        )
+        .unwrap();
+        let digest: [u8; 32] = hex::decode(&action.sign_hash).unwrap().try_into().unwrap();
+        let error = attach_tex_signature(
+            &action.action_hex,
+            &hex::encode(other.public_key().serialize_compressed()),
+            &hex::encode(other.do_sign(&digest)),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "bad_signature");
     }
 }

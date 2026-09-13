@@ -4,11 +4,12 @@
 use crate::json::SdkJsonTo;
 use crate::schema::{DOMAIN_CODEC_PROFILE, SCHEMA_CODEC_PROFILE};
 
-pub const SDK_VERSION: &str = "0.2.1";
+pub const SDK_VERSION: &str = "0.2.2";
 pub const ABI_MAJOR: u32 = 2;
+/// v2.6: adds externally signed TEX order/take action preparation.
 /// v2.5: the codec profile reports and hashes transaction-type membership;
 /// the wallet surface admits only current Type-2/3 envelopes.
-pub const ABI_MINOR: u32 = 5;
+pub const ABI_MINOR: u32 = 6;
 /// Fullnode source commit this SDK's protocol/codec behavior corresponds to.
 /// Injected from git by `build.rs`, never hand-maintained.
 pub const FULLNODE_COMMIT: &str = env!("SDK_FULLNODE_COMMIT");
@@ -222,6 +223,7 @@ pub(crate) enum RequestField {
     TransactionSpec(&'static str),
     OptionalJson(&'static str),
     OptionalU64(&'static str),
+    U64(&'static str),
     U8(&'static str),
     /// Inspect context `{current_height, expected_chain_id}`: marker 0/1,
     /// then u64 + u32 when present.
@@ -238,6 +240,7 @@ impl RequestField {
             | RequestField::TransactionSpec(a)
             | RequestField::OptionalJson(a)
             | RequestField::OptionalU64(a)
+            | RequestField::U64(a)
             | RequestField::U8(a)
             | RequestField::OptionalInspectContext(a) => *a,
         }
@@ -271,6 +274,9 @@ macro_rules! op_req {
     };
     (opt_u64($a:literal)) => {
         RequestField::OptionalU64($a)
+    };
+    (u64($a:literal)) => {
+        RequestField::U64($a)
     };
     (u8($a:literal)) => {
         RequestField::U8($a)
@@ -328,4 +334,7 @@ define_operations! {
     (OP_VM_DECODE_CALL, "vm.decode_call", [string("action")]),
     (OP_ACTION_DESCRIBE, "action.describe", [string("action"), optional_json("describe")]),
     (OP_VM_CODE, "vm.code", [string("codes"), string("code_type"), optional_string("format"), optional_json("sourcemap"), opt_u64("limit"), opt_u64("offset")]),
+    (OP_TEX_CREATE_ORDER, "tex.create_order", [string("address"), string("side"), u64("serial"), u64("texauth_serial"), u64("price_mei_per_hacp"), u64("total_hacp"), u64("maker_balance_at_signing"), string("denominations"), u64("expire_height"), u64("chain_id"), u64("fee_bps")]),
+    (OP_TEX_CREATE_TAKE, "tex.create_take", [string("address"), string("order_side"), u64("order_id"), u64("take_nonce"), u64("serial"), u64("texauth_serial"), u64("price_mei_per_hacp"), u64("hacp_amount"), u64("fee_bps"), u64("expire_height"), u64("chain_id")]),
+    (OP_TEX_ATTACH_SIGNATURE, "tex.attach_signature", [string("action"), string("public_key"), string("signature")]),
 }

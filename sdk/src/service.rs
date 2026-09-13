@@ -11,10 +11,11 @@ use crate::profile::{
     CodecProfile, OP_ACCOUNT_ADDRESS_FROM_PUBLIC_KEY, OP_ACCOUNT_VERIFY_ADDRESS,
     OP_ACCOUNT_VERIFY_SIGNATURE, OP_ACTION_DESCRIBE, OP_AMOUNT_FORMAT, OP_AMOUNT_PARSE,
     OP_DIAMOND_LOOKUP, OP_MESSAGE_PREPARE_SIGNATURE, OP_MESSAGE_VERIFY, OP_POLICY_EVALUATE,
-    OP_SYSTEM_PARAMS, OP_SYSTEM_SDK_VERSION, OP_TX_ATTACH_SIGNATURE,
-    OP_TX_ATTACH_SIGNATURE_UNBOUND, OP_TX_BUILD, OP_TX_DECODE, OP_TX_ENCODE, OP_TX_ESTIMATE_FEE,
-    OP_TX_INSPECT, OP_TX_INSPECT_REPORT, OP_TX_PREPARE_SIGNATURE, OP_TX_SIGNATURE_REPORT,
-    OP_TX_VERIFY, OP_VM_CODE, OP_VM_DECODE_CALL, OPERATIONS, RequestField,
+    OP_SYSTEM_PARAMS, OP_SYSTEM_SDK_VERSION, OP_TEX_ATTACH_SIGNATURE, OP_TEX_CREATE_ORDER,
+    OP_TEX_CREATE_TAKE, OP_TX_ATTACH_SIGNATURE, OP_TX_ATTACH_SIGNATURE_UNBOUND, OP_TX_BUILD,
+    OP_TX_DECODE, OP_TX_ENCODE, OP_TX_ESTIMATE_FEE, OP_TX_INSPECT, OP_TX_INSPECT_REPORT,
+    OP_TX_PREPARE_SIGNATURE, OP_TX_SIGNATURE_REPORT, OP_TX_VERIFY, OP_VM_CODE, OP_VM_DECODE_CALL,
+    OPERATIONS, RequestField,
 };
 
 pub(crate) fn profile() -> &'static CodecProfile {
@@ -82,6 +83,7 @@ enum ReqValue {
     OptStr(Option<String>),
     OptJson(Option<String>),
     OptU64(Option<u64>),
+    U64(u64),
     U8(u8),
     OptInspectContext(Option<crate::inspect::InspectContext>),
 }
@@ -143,6 +145,16 @@ impl ReqValue {
             _ => Err(SdkError::new(
                 SdkErrorCode::ParseFailed,
                 "request field is not a u8",
+            )),
+        }
+    }
+
+    fn u64(&self) -> Result<u64, SdkError> {
+        match self {
+            ReqValue::U64(value) => Ok(*value),
+            _ => Err(SdkError::new(
+                SdkErrorCode::ParseFailed,
+                "request field is not a u64",
             )),
         }
     }
@@ -215,6 +227,9 @@ fn parse_request_json(
             }
             RequestField::OptionalU64(_) => {
                 ReqValue::OptU64(jsonparse::optional_number(&pairs, name, &context)?)
+            }
+            RequestField::U64(_) => {
+                ReqValue::U64(jsonparse::required_number(&pairs, name, &context)?)
             }
             RequestField::U8(_) => {
                 ReqValue::U8(jsonparse::required_number(&pairs, name, &context)?)
@@ -504,6 +519,49 @@ fn route_json(operation_id: u16, payload: &str) -> Result<String, SdkError> {
             )?
             .to_json_string())
         }
+        OP_TEX_CREATE_ORDER => {
+            let v = parse_request_json(operation_id, payload)?;
+            Ok(crate::tex::create_tex_order(
+                req_field(&v, "address")?.str()?,
+                req_field(&v, "side")?.str()?,
+                req_field(&v, "serial")?.u64()?,
+                req_field(&v, "texauth_serial")?.u64()?,
+                req_field(&v, "price_mei_per_hacp")?.u64()?,
+                req_field(&v, "total_hacp")?.u64()?,
+                req_field(&v, "maker_balance_at_signing")?.u64()?,
+                req_field(&v, "denominations")?.str()?,
+                req_field(&v, "expire_height")?.u64()?,
+                req_field(&v, "chain_id")?.u64()?,
+                req_field(&v, "fee_bps")?.u64()?,
+            )?
+            .to_json_string())
+        }
+        OP_TEX_CREATE_TAKE => {
+            let v = parse_request_json(operation_id, payload)?;
+            Ok(crate::tex::create_tex_take(
+                req_field(&v, "address")?.str()?,
+                req_field(&v, "order_side")?.str()?,
+                req_field(&v, "order_id")?.u64()?,
+                req_field(&v, "take_nonce")?.u64()?,
+                req_field(&v, "serial")?.u64()?,
+                req_field(&v, "texauth_serial")?.u64()?,
+                req_field(&v, "price_mei_per_hacp")?.u64()?,
+                req_field(&v, "hacp_amount")?.u64()?,
+                req_field(&v, "fee_bps")?.u64()?,
+                req_field(&v, "expire_height")?.u64()?,
+                req_field(&v, "chain_id")?.u64()?,
+            )?
+            .to_json_string())
+        }
+        OP_TEX_ATTACH_SIGNATURE => {
+            let v = parse_request_json(operation_id, payload)?;
+            Ok(crate::tex::attach_tex_signature(
+                req_field(&v, "action")?.str()?,
+                req_field(&v, "public_key")?.str()?,
+                req_field(&v, "signature")?.str()?,
+            )?
+            .to_json_string())
+        }
         _ => Err(SdkError::new(
             SdkErrorCode::UnknownOperation,
             format!("unknown operation id {}", operation_id),
@@ -557,6 +615,19 @@ mod tests {
         let version = field_names(&invoke_ok(OP_SYSTEM_SDK_VERSION, ""));
         assert!(version.iter().any(|n| n == "package_version"));
         assert!(version.iter().any(|n| n == "abi"));
+    }
+
+    #[test]
+    fn tex_order_routes_through_the_json_boundary() {
+        let account = sys::Account::create_by("sdk_tex_dispatch").unwrap();
+        let payload = format!(
+            r#"{{"address":"{}","side":"sell_hacp","serial":"1025","texauth_serial":"1026","price_mei_per_hacp":"300000000","total_hacp":"100","maker_balance_at_signing":"500","denominations":"1,10,100","expire_height":"765900","chain_id":"0","fee_bps":"25"}}"#,
+            account.readable()
+        );
+        let result = invoke_ok(OP_TEX_CREATE_ORDER, &payload);
+        assert!(result.contains(r#""schema":"tex-order@1""#), "{result}");
+        assert!(result.contains(r#""denomination":"100""#), "{result}");
+        assert!(result.contains(r#""action_hex":"0016"#), "{result}");
     }
 
     #[test]

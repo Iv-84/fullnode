@@ -13,6 +13,11 @@ const DMD_L: usize = 10;
 const DMD_M: usize = 16;
 const DMD_N: usize = DMD_M - DMD_L;
 
+const MODIFFBITS: [u8; H32S] = [
+    128, 132, 136, 140, 144, 148, 152, 156, 160, 164, 168, 172, 176, 180, 184, 188, 192, 196,
+    200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240, 244, 248, 252,
+];
+
 pub fn sha3(data: impl AsRef<[u8]>) -> [u8; H32S] {
     let mut hasher = Sha3_256::new();
     hasher.update(data);
@@ -75,14 +80,10 @@ pub fn check_diamond_hash_result(stuff: impl AsRef<[u8]>) -> Option<[u8; DMD_N]>
     Some(hxval[DMD_L..DMD_M].try_into().unwrap())
 }
 
-pub fn check_diamond_difficulty(number: u32, sha3hx: &[u8; H32S], x16rshx: &[u8; H32S]) -> bool {
-    const MODIFFBITS: [u8; H32S] = [
-        128, 132, 136, 140, 144, 148, 152, 156, 160, 164, 168, 172, 176, 180, 184, 188, 192, 196,
-        200, 204, 208, 212, 216, 220, 224, 228, 232, 236, 240, 244, 248, 252,
-    ];
-
+/// Difficulty step 1, which only needs the inexpensive SHA3 digest.
+pub fn check_diamond_difficulty_sha3(number: u32, sha3hx: &[u8; H32S]) -> bool {
     let sha3_required_leading = number as usize / 42_000;
-    let sha3_max_byte = 255 - (number / 65_536).min(255) as u8;
+    let sha3_max_byte = 255u8.wrapping_sub((number / 65_536) as u8);
     for i in 0..H32S {
         if i < sha3_required_leading && sha3hx[i] >= MODIFFBITS[i] {
             return false;
@@ -91,7 +92,26 @@ pub fn check_diamond_difficulty(number: u32, sha3hx: &[u8; H32S], x16rshx: &[u8;
             return false;
         }
     }
+    true
+}
 
+/// Expected fraction of uniformly distributed SHA3 digests that pass step 1.
+pub fn diamond_sha3_gate_pass_rate(number: u32) -> f64 {
+    let sha3_required_leading = number as usize / 42_000;
+    let sha3_max_byte = 255u8.wrapping_sub((number / 65_536) as u8);
+    let mut rate = 1.0f64;
+    for i in 0..H32S {
+        let mut maximum = sha3_max_byte as u32;
+        if i < sha3_required_leading {
+            maximum = maximum.min(MODIFFBITS[i] as u32 - 1);
+        }
+        rate *= (maximum as f64 + 1.0) / 256.0;
+    }
+    rate
+}
+
+/// Difficulty step 2, which only needs the expensive X16RS digest.
+pub fn check_diamond_difficulty_x16rs(number: u32, x16rshx: &[u8; H32S]) -> bool {
     let mut remaining_diff = number as usize / 3277;
     for a in x16rshx {
         if remaining_diff < 255 {
@@ -106,6 +126,11 @@ pub fn check_diamond_difficulty(number: u32, sha3hx: &[u8; H32S], x16rshx: &[u8;
         }
     }
     false
+}
+
+pub fn check_diamond_difficulty(number: u32, sha3hx: &[u8; H32S], x16rshx: &[u8; H32S]) -> bool {
+    check_diamond_difficulty_sha3(number, sha3hx)
+        && check_diamond_difficulty_x16rs(number, x16rshx)
 }
 
 pub fn mine_diamond_hash_repeat(number: u32) -> i32 {
@@ -133,6 +158,18 @@ pub fn mine_diamond(
     address: &[u8; 21],
     custom_message: impl AsRef<[u8]>,
 ) -> ([u8; H32S], [u8; H32S], [u8; DMD_M]) {
+    let seed_hash = mine_diamond_sha3(prevblockhash, nonce, address, custom_message);
+    let (result_hash, diamond_str) = mine_diamond_x16rs(number, &seed_hash);
+    (seed_hash, result_hash, diamond_str)
+}
+
+/// Calculate the SHA3 stage separately so failed nonces can skip X16RS.
+pub fn mine_diamond_sha3(
+    prevblockhash: &[u8; H32S],
+    nonce: &[u8; 8],
+    address: &[u8; 21],
+    custom_message: impl AsRef<[u8]>,
+) -> [u8; H32S] {
     let custom = custom_message.as_ref();
     let mut stuff =
         Vec::with_capacity(prevblockhash.len() + nonce.len() + address.len() + custom.len());
@@ -140,9 +177,13 @@ pub fn mine_diamond(
     stuff.extend_from_slice(nonce);
     stuff.extend_from_slice(address);
     stuff.extend_from_slice(custom);
-    let seed_hash = calculate_hash(stuff);
+    calculate_hash(stuff)
+}
+
+/// Calculate the X16RS stage and derive the corresponding diamond string.
+pub fn mine_diamond_x16rs(number: u32, seed_hash: &[u8; H32S]) -> ([u8; H32S], [u8; DMD_M]) {
     let repeat = mine_diamond_hash_repeat(number);
-    let result_hash = x16rs_hash(repeat, &seed_hash);
+    let result_hash = x16rs_hash(repeat, seed_hash);
     let diamond_str = diamond_hash(&result_hash);
-    (seed_hash, result_hash, diamond_str)
+    (result_hash, diamond_str)
 }

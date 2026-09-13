@@ -20,6 +20,10 @@ pub struct OpenCLResources {
     pub buffer_global_hashes: Buffer<u8>,
     pub buffer_global_order: Buffer<u32>,
     pub buffer_best_hashes: Buffer<u8>,
+    // The SHA3 gate breaks the old slot-to-nonce identity. Keep the nonce for
+    // every X16RS slot and count the nonces actually probed by each workgroup.
+    pub buffer_slot_nonces: Buffer<u64>,
+    pub buffer_probe_counts: Buffer<u64>,
 }
 
 pub fn initialize_opencl(
@@ -203,6 +207,18 @@ pub fn initialize_opencl(
                 .len(HASH_WIDTH * workgroups as usize)
                 .build()
                 .expect("can't create buffer_best_hashes"),
+            buffer_slot_nonces: Buffer::<u64>::builder()
+                .queue(queue.clone())
+                .flags(ocl::core::MEM_READ_WRITE)
+                .len(unitsize as usize * global_work_size as usize)
+                .build()
+                .expect("can't create buffer_slot_nonces"),
+            buffer_probe_counts: Buffer::<u64>::builder()
+                .queue(queue.clone())
+                .flags(ocl::core::MEM_WRITE_ONLY)
+                .len(workgroups)
+                .build()
+                .expect("can't create buffer_probe_counts"),
         });
     }
 

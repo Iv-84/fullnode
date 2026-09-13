@@ -9,6 +9,21 @@ use crate::diamond_mining::{
 
 use super::common::{OpenCLResources, enqueue_kernel_checked};
 
+/// Nonces reserved per OpenCL work item to fill its X16RS slots after the
+/// inexpensive SHA3 difficulty gate. Twice the expected span leaves margin
+/// for normal random variation without doing extra work once the slots fill.
+pub fn diamond_probe_span(number: u32, unit_size: u32) -> u32 {
+    let pass_rate = x16rs::diamond_sha3_gate_pass_rate(number);
+    if !pass_rate.is_finite() || pass_rate <= 0.0 {
+        return unit_size.max(1);
+    }
+    let wanted = (unit_size.max(1) as f64 * 2.0 / pass_rate).ceil();
+    if !wanted.is_finite() || wanted >= u32::MAX as f64 {
+        return u32::MAX;
+    }
+    (wanted as u32).max(unit_size.max(1))
+}
+
 pub fn do_diamond_group_mining_opencl(
     opencl: &OpenCLResources,
     number: u32,
@@ -66,6 +81,10 @@ pub fn do_diamond_group_mining_opencl(
         .enq()
         .expect("can't reset diamond candidate count");
 
+    let probe_span = diamond_probe_span(number, unit_size);
+    let gate_modiff_len = number / 42_000;
+    let gate_max_byte = 255u8.wrapping_sub((number / 65_536) as u8) as u32;
+
     let kernel = Kernel::builder()
         .program(&opencl.program)
         .name("x16rs_diamond")
@@ -76,8 +95,13 @@ pub fn do_diamond_group_mining_opencl(
         .arg(nonce_start)
         .arg(repeat)
         .arg(unit_size)
+        .arg(probe_span)
+        .arg(gate_modiff_len)
+        .arg(gate_max_byte)
         .arg(&opencl.buffer_global_hashes)
         .arg(&opencl.buffer_global_order)
+        .arg(&opencl.buffer_slot_nonces)
+        .arg(&opencl.buffer_probe_counts)
         .arg(&opencl.buffer_best_hashes)
         .arg(&opencl.buffer_best_nonces_diamond)
         .arg(&opencl.buffer_diamond_candidate_nonces)
@@ -109,6 +133,22 @@ pub fn do_diamond_group_mining_opencl(
         .enq()
         .expect("can't read diamond best nonces");
 
+    let mut probe_counts = vec![0u64; opencl.buffer_probe_counts.len()];
+    opencl
+        .buffer_probe_counts
+        .read(&mut probe_counts)
+        .ewait(&kernel_event)
+        .enq()
+        .expect("can't read diamond probe counts");
+    let probed_total = probe_counts
+        .iter()
+        .take(num_work_groups as usize)
+        .copied()
+        .sum();
+    if probed_total > 0 {
+        best.nonce_space = probed_total;
+    }
+
     let mut candidate_count = [0u32];
     opencl
         .buffer_diamond_candidate_count
@@ -116,7 +156,15 @@ pub fn do_diamond_group_mining_opencl(
         .ewait(&kernel_event)
         .enq()
         .expect("can't read diamond candidate count");
-    let candidate_count = (candidate_count[0] as usize).min(opencl.diamond_candidate_capacity);
+    let found_candidate_count = candidate_count[0] as usize;
+    let candidate_count = found_candidate_count.min(opencl.diamond_candidate_capacity);
+    if found_candidate_count > opencl.diamond_candidate_capacity {
+        eprintln!(
+            "[warn] OpenCL diamond candidate buffer full: kept {}, dropped {}",
+            opencl.diamond_candidate_capacity,
+            found_candidate_count - opencl.diamond_candidate_capacity
+        );
+    }
     if candidate_count > 0 {
         let mut candidate_nonces = vec![0u64; candidate_count];
         opencl

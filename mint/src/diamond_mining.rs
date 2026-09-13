@@ -51,3 +51,47 @@ pub fn diamond_candidate_more_power(dst: &[u8], src: &[u8]) -> bool {
     }
     diamond_more_power(dst, src)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diamond_name_validity_matches_consensus() {
+        assert!(diamond_hash_result_valid(b"0000000000WTYUIA"));
+        assert!(!diamond_hash_result_valid(b"000000000WTYUIAH"));
+        assert!(!diamond_hash_result_valid(b"00000000000TYUIA"));
+        assert!(!diamond_hash_result_valid(b"0000000000WTYUI0"));
+        assert!(!diamond_hash_result_valid(b"0000000000WTYUI"));
+    }
+
+    #[test]
+    fn overshooting_name_does_not_mask_valid_diamond() {
+        let valid = b"0000000000WTYUIA";
+        let overshoot = b"00000000000TYUIA";
+        assert!(diamond_more_power(overshoot, valid));
+        assert!(!diamond_candidate_more_power(overshoot, valid));
+        assert!(diamond_candidate_more_power(valid, overshoot));
+    }
+
+    #[test]
+    fn invalid_candidates_still_rank_by_leading_zeros() {
+        let closer = b"00000WTYUIAHXVMK";
+        let further = b"WTYUIAHXVMEKBSZN";
+        assert!(diamond_candidate_more_power(closer, further));
+        assert!(!diamond_candidate_more_power(further, closer));
+    }
+
+    #[test]
+    fn initial_sentinel_loses_to_candidates() {
+        let sentinel = [b'W'; 16];
+        assert!(diamond_candidate_more_power(
+            b"0000000000WTYUIA",
+            &sentinel
+        ));
+        assert!(diamond_candidate_more_power(
+            b"00000WTYUIAHXVMK",
+            &sentinel
+        ));
+    }
+}

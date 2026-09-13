@@ -8,4 +8,9 @@ sys = { workspace = true }
 sha2 = "0.10"
 sha3 = "0.10"
 ripemd = "0.1"
+# 0.1.2 fixes the FFI declaration of the output buffer (0.1.1 declared it
+# *const u8 while the C side writes through it, which is UB).
 x16rs-sys = "=0.1.2"
+
+[dev-dependencies]
+hex = "0.4.3"

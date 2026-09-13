@@ -221,7 +221,7 @@ fn worker_loop(
         let prev_hash = *MINING_PREV_HASH.read().unwrap();
         let custom_message = random_hash();
         let mut nonce_start = 0u64;
-        let mut nonce_space = backend_nonce_space(&backend).max(1);
+        let mut nonce_space = backend_nonce_space(&backend, number).max(1);
 
         loop {
             let started = Instant::now();
@@ -276,7 +276,7 @@ fn worker_loop(
     }
 }
 
-fn backend_nonce_space(backend: &MinerBackend) -> u64 {
+fn backend_nonce_space(backend: &MinerBackend, number: u32) -> u64 {
     match backend {
         MinerBackend::Cpu => 15_000,
         #[cfg(feature = "ocl")]
@@ -287,7 +287,7 @@ fn backend_nonce_space(backend: &MinerBackend) -> u64 {
             ..
         } => (*workgroups as u64)
             .saturating_mul(*localsize as u64)
-            .saturating_mul(*unitsize as u64),
+            .saturating_mul(dia::diamond_probe_span(number, *unitsize) as u64),
     }
 }
 
@@ -331,13 +331,16 @@ fn do_diamond_group_mining(
     for nonce in nonce_start..nonce_end {
         let nonce_bytes = nonce.to_be_bytes();
         let prev_hash_array = prev_hash.into_array();
-        let (first_hash, result_hash, diamond_string) = x16rs::mine_diamond(
-            number,
+        let first_hash = x16rs::mine_diamond_sha3(
             &prev_hash_array,
             &nonce_bytes,
             reward_address.as_array(),
             custom_nonce,
         );
+        if !x16rs::check_diamond_difficulty_sha3(number, &first_hash) {
+            continue;
+        }
+        let (result_hash, diamond_string) = x16rs::mine_diamond_x16rs(number, &first_hash);
         if let Some(diamond_name) =
             check_diamond_success(number, first_hash, result_hash, diamond_string)
         {
@@ -546,4 +549,33 @@ fn parse_hash_hex(v: &str) -> Option<Hash> {
     let bytes = hex::decode(v).ok()?;
     let arr: [u8; HASH_WIDTH] = bytes.as_slice().try_into().ok()?;
     Some(Hash::from(arr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn height_gate_allows_configured_tails() {
+        let tails = vec![0, 5];
+        assert!(is_allowed_diamond_mining_height(0, &tails));
+        assert!(is_allowed_diamond_mining_height(25, &tails));
+        assert!(!is_allowed_diamond_mining_height(14, &tails));
+    }
+
+    #[test]
+    fn height_gate_is_open_without_tails() {
+        for height in 0..10 {
+            assert!(is_allowed_diamond_mining_height(height, &[]));
+        }
+    }
+
+    #[test]
+    fn configured_tails_are_trimmed_and_deduplicated() {
+        assert_eq!(
+            parse_diamond_mining_height_tails("0, 5,5, 9").unwrap(),
+            vec![0, 5, 9]
+        );
+        assert!(parse_diamond_mining_height_tails("10").is_err());
+    }
 }

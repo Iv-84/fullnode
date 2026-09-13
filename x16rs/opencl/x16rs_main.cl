@@ -63,7 +63,17 @@ __kernel void x16rs_main(
         mixtab0, mixtab1, mixtab2, mixtab3
     );
     
-    unsigned int best_hash = 0;
+    // the loop above left this work item's slots written by other work items
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+    /*
+     * Seed the scan with this work item's OWN first slot. Seeding it with the
+     * absolute slot 0 instead (which belongs to work item 0) left slot
+     * `index + 0` of every other work item hashed but never compared, so one
+     * nonce per work item was silently dropped -- (local_size - 1) out of
+     * local_size * unit_size per work group, and the winning nonce with it.
+     */
+    unsigned int best_hash = index;
     for (unsigned int i = 1; i < unit_size; i++) {
         if (diff_big_hash(&local_hashes[best_hash], &local_hashes[index + i]) == 1) {
             best_hash = index + i;

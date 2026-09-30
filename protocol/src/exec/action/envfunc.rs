@@ -5,33 +5,15 @@ use field::{Address, AddressW1, DiamondName, Encode};
 use sys::errf;
 
 use crate::codec::action::{
-    BalanceAsset, BalanceCoin, BlockAuthorAddr, CheckSignature, EnvHeight, HacdInscGet,
-    HacdInscNum, HacdNameList, HacdOwnerAddrs, SigsetAtLeast, SigsetCount, TxBlob, TxBlobNum,
-    TxBlobSize, TxMainAddr, TxMessage, TxMessageNum,
+    AssetMeta, BalanceAsset, BalanceCoin, BalanceFungible, BlockAuthorAddr,
+    CheckSignature, EnvHeight, HacdInscGet, HacdInscNum, HacdNameList,
+    HacdOwnerAddrs, SigsetAtLeast, SigsetCount, TxBlob, TxBlobNum, TxBlobSize,
+    TxMainAddr, TxMessage, TxMessageNum, TxMessageSingle,
 };
-
-/// Temporary upgrade gate for the tx message/blob read syscalls (0x0615/0x0616/
-/// 0x0617/0x0704/0x0705), which take effect at height 784_000. Hand-written on
-/// purpose — remove the const, this helper and the five call sites together with
-/// the syscalls in the next release.
-const TX_MSG_BLOB_ENABLE_HEIGHT: u64 = 784_000;
-
-fn tx_message_blob_gate(ctx: &dyn base::Context) -> sys::Rerr {
-    // Mainnet activates at height 784_000. Non-mainnet (hacash-testnet chain_id=1)
-    // enables immediately so deposit hooks can ViewMessage on a local chain.
-    if ctx.env().chain.id.is_mainnet() && ctx.env().block.height < TX_MSG_BLOB_ENABLE_HEIGHT {
-        return errf!(
-            "tx message/blob syscall not enabled until height {}",
-            TX_MSG_BLOB_ENABLE_HEIGHT
-        );
-    }
-    Ok(())
-}
 
 base::impl_action_execute! {
     TxMessage {
         (self, ctx) {
-            tx_message_blob_gate(ctx)?;
             let mut n = 0u8;
             for action in ctx.tx().actions() {
                 if let Some(msg) = action.as_any().downcast_ref::<crate::codec::action::Message>() {
@@ -45,9 +27,24 @@ base::impl_action_execute! {
 }
 
 base::impl_action_execute! {
+    TxMessageSingle {
+        (self, ctx) {
+            let mut messages = ctx.tx().actions().iter()
+                .filter_map(|a| a.as_any().downcast_ref::<crate::codec::action::Message>());
+            let Some(message) = messages.next() else {
+                return errf!("transaction must contain exactly one message");
+            };
+            if messages.next().is_some() {
+                return errf!("transaction must contain exactly one message");
+            }
+            Ok(message.data.as_ref().to_vec())
+        }
+    }
+}
+
+base::impl_action_execute! {
     TxBlob {
         (self, ctx) {
-            tx_message_blob_gate(ctx)?;
             let mut n = 0u8;
             for action in ctx.tx().actions() {
                 if let Some(blob) = action.as_any().downcast_ref::<crate::codec::action::Blob>() {
@@ -70,7 +67,6 @@ base::impl_action_execute! {
 
 base::impl_action_execute! {
     TxMessageNum { (self, ctx) {
-        tx_message_blob_gate(ctx)?;
         let n = ctx.tx().actions().iter().filter(|a| a.as_any().is::<crate::codec::action::Message>()).count();
         if n > u8::MAX as usize { return errf!("message count exceeds u8"); }
         Ok(vec![n as u8])
@@ -78,7 +74,6 @@ base::impl_action_execute! {
 }
 base::impl_action_execute! {
     TxBlobNum { (self, ctx) {
-        tx_message_blob_gate(ctx)?;
         let n = ctx.tx().actions().iter().filter(|a| a.as_any().is::<crate::codec::action::Blob>()).count();
         if n > u8::MAX as usize { return errf!("blob count exceeds u8"); }
         Ok(vec![n as u8])
@@ -86,7 +81,6 @@ base::impl_action_execute! {
 }
 base::impl_action_execute! {
     TxBlobSize { (self, ctx) {
-        tx_message_blob_gate(ctx)?;
         let mut n = 0u8;
         for action in ctx.tx().actions() {
             if let Some(blob) = action.as_any().downcast_ref::<crate::codec::action::Blob>() {
@@ -169,6 +163,59 @@ base::impl_action_execute! {
                 .map(|a| a.amount.uint())
                 .unwrap_or(0);
             Ok(amt.to_be_bytes().to_vec())
+        }
+    }
+}
+
+base::impl_action_execute! {
+    BalanceFungible {
+        (self, ctx) {
+            let serial = self.serial.uint();
+            if serial == 0 || (4..=10).contains(&serial) {
+                return errf!(
+                    "fungible serial {} is not hac, sat, hacd, or an asset above 10",
+                    serial
+                );
+            }
+            let balances = CoreState::wrap(ctx.layer())
+                .balance(&self.addr)?
+                .unwrap_or_default();
+            let amount = match serial {
+                // 1 = HAC as exact zhu. Sub-zhu residue or a value above u64 aborts. Zero is 0.
+                1 => balances.hacash.to_zhu_u64_exact()?,
+                2 => balances.satoshi.uint(),
+                // 3 = HACD count. The same number is not an asset through this ABI.
+                3 => balances.diamond.uint(),
+                _ => balances.assets.as_list().iter()
+                    .find(|a| a.serial.uint() == serial)
+                    .map(|a| a.amount.uint())
+                    .unwrap_or(0),
+            };
+            Ok(amount.to_be_bytes().to_vec())
+        }
+    }
+}
+
+// Canonical fixed layout (30 bytes): `[decimal u8][supply u64 BE][issuer raw21]`.
+// Frozen consensus ABI: fields are never reordered/widened/removed; new metadata
+// fields arrive as new syscalls, so whole-blob equality in deployed contracts
+// stays valid.
+base::impl_action_execute! {
+    AssetMeta {
+        (self, ctx) {
+            let serial = self.serial.uint();
+            if serial == 0 {
+                return errf!("asset serial cannot be zero");
+            }
+            let meta = match CoreState::wrap(ctx.layer()).asset(&self.serial)? {
+                Some(m) => m,
+                None => return errf!("asset serial {} not found", serial),
+            };
+            let mut res = Vec::with_capacity(30);
+            res.push(meta.decimal.uint() as u8);
+            res.extend_from_slice(&meta.supply.uint().to_be_bytes());
+            res.extend_from_slice(meta.issuer.as_ref());
+            Ok(res)
         }
     }
 }

@@ -31,6 +31,24 @@ pub struct IntentEntry {
     pub data: MKVMap,
 }
 
+/// How the shared `inc` / `add` arithmetic core treats a key that is not present yet.
+#[derive(Clone, Copy)]
+enum MissingBase {
+    /// The key must already exist; otherwise the call fails with key-not-found.
+    Required,
+    /// Treat the absent key as the additive identity expressed at the **delta's own
+    /// uint width**, so `inc(key, d)` on a missing key is exactly `put(key, d)` —
+    /// same value *and* same uint type.
+    ///
+    /// This keeps the width rule uniform: the result width is
+    /// `max(existing_width, delta_width)` on every path, including the first write,
+    /// so a counter first created by `inc` and one first created by `put` and then
+    /// incremented behave identically. Anchoring the identity at the delta's width
+    /// (rather than at a fixed width such as 64) is what removes the special case:
+    /// promoting a zero of width `w` against a delta of width `w` stays at `w`.
+    ZeroAtDeltaWidth,
+}
+
 #[derive(Clone, Debug, Default)]
 struct IntentBucketMap {
     datas: HashMap<Address, HashMap<usize, IntentEntry>>,
@@ -138,6 +156,16 @@ impl IntentRuntime {
             return itr_err_fmt!(ItrErrCode::IntentError, "intent kind cannot be empty");
         }
         self.check_size_limit(kind.len(), "kind")?;
+        // kind names at most one open intent per owner: two open intents sharing a
+        // kind would leave `intent_use_open` with nothing to resolve, so the second
+        // creation is refused here rather than deferred to the lookup. The name is
+        // freed again by destroying the intent.
+        if !self.open_ids_by_kind(&owner, &kind)?.is_empty() {
+            return itr_err_fmt!(
+                ItrErrCode::IntentError,
+                "intent kind already open for this contract"
+            );
+        }
         if self.total_created >= self.create_limit {
             return itr_err_fmt!(
                 ItrErrCode::IntentError,
@@ -145,6 +173,10 @@ impl IntentRuntime {
                 self.create_limit
             );
         }
+        self.insert_entry(owner, kind)
+    }
+
+    fn insert_entry(&mut self, owner: ContractAddress, kind: Vec<u8>) -> VmrtRes<usize> {
         let next_gen = self.next_intent_id()?;
         self.id_generation = next_gen;
         self.next_id = next_gen;
@@ -158,6 +190,18 @@ impl IntentRuntime {
             },
         );
         Ok(next_gen)
+    }
+
+    /// Test-only: insert an intent past the kind-uniqueness check, so the defensive
+    /// branches that keep duplicate kinds fail-closed stay covered even though
+    /// `create` can no longer produce that state.
+    #[cfg(test)]
+    pub(crate) fn create_ignoring_kind_uniqueness(
+        &mut self,
+        owner: ContractAddress,
+        kind: Vec<u8>,
+    ) -> VmrtRes<usize> {
+        self.insert_entry(owner, kind)
     }
 
     fn intent_not_found(id: usize) -> ItrErr {
@@ -460,13 +504,28 @@ impl IntentRuntime {
         Ok(())
     }
 
+    /// Zero of the same uint width as `delta`, for [`MissingBase::ZeroAtDeltaWidth`].
+    fn zero_uint_at_delta_width(delta: &Value, delta_err: &str) -> VmrtRes<Value> {
+        let bits = delta
+            .ty()
+            .uint_bits()
+            .ok_or_else(|| ItrErr::new(ItrErrCode::IntentError, delta_err))?;
+        let mut zero = Value::U64(0);
+        zero.cast_to_uint_width(bits)
+            .map_err(|ItrErr(_, msg)| ItrErr::new(ItrErrCode::IntentError, &msg))?;
+        Ok(zero)
+    }
+
+    /// Shared `inc` / `add` core: promote the stored value and `delta` to their
+    /// common uint width, add with overflow checking, then store the result.
+    /// `missing_base` decides what an absent key means; see [`MissingBase`].
     fn add_core(
         &mut self,
         owner: &ContractAddress,
         id: usize,
         key: Value,
         delta: Value,
-        missing_base: Option<Value>,
+        missing_base: MissingBase,
         delta_err: &str,
         target_err: &str,
         overflow_err: &str,
@@ -484,7 +543,12 @@ impl IntentRuntime {
                 }
                 existing
             } else {
-                missing_base.ok_or_else(Self::key_not_found)?
+                match missing_base {
+                    MissingBase::Required => return Err(Self::key_not_found()),
+                    MissingBase::ZeroAtDeltaWidth => {
+                        Self::zero_uint_at_delta_width(&delta, delta_err)?
+                    }
+                }
             }
         };
         let val = Self::uint_add_checked_with_msg(&base, &delta, overflow_err)?;
@@ -530,7 +594,7 @@ impl IntentRuntime {
             id,
             key,
             delta,
-            None,
+            MissingBase::Required,
             "intent add delta must be uint",
             "intent add target must be uint",
             "intent add overflow",
@@ -561,6 +625,12 @@ impl IntentRuntime {
         Ok(val)
     }
 
+    /// Increment `key` by `delta` using checked arithmetic.
+    ///
+    /// On an absent key the counter starts at zero *of the delta's own uint width*,
+    /// so the first `inc` is equivalent to `put(key, delta)` — result type included.
+    /// See [`MissingBase::ZeroAtDeltaWidth`]. Existing counters keep the usual rule:
+    /// the result width is `max(existing_width, delta_width)`.
     pub fn inc(
         &mut self,
         owner: &ContractAddress,
@@ -573,7 +643,7 @@ impl IntentRuntime {
             id,
             key,
             delta,
-            Some(Value::U64(0)),
+            MissingBase::ZeroAtDeltaWidth,
             "intent inc delta must be uint",
             "intent inc target must be uint",
             "intent inc overflow",
@@ -775,6 +845,70 @@ impl IntentRuntime {
             None
         };
         Ok((next, page))
+    }
+
+    /// Ids of every open intent owned by `owner` whose kind equals `kind`, ascending.
+    ///
+    /// This is the lookup behind `intent_use_open`, which binds only when exactly one
+    /// intent answers: zero means there is nothing to address. `create` refuses a
+    /// second open intent of the same kind, so more than one result is unreachable —
+    /// the caller still checks for it, as the net under that rule.
+    pub fn open_ids_by_kind(&self, owner: &ContractAddress, kind: &[u8]) -> VmrtRes<Vec<usize>> {
+        let Some(bucket) = self.buckets.get(owner) else {
+            return Ok(Vec::new());
+        };
+        let mut ids = Vec::new();
+        for (id, entry) in bucket {
+            if entry.kind == kind {
+                ids.push(*id);
+            }
+        }
+        // Bucket iteration order is hash order; sorting restores a deterministic result.
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    /// Paged enumeration of `owner`'s open intents by ascending id: the kinds of the
+    /// intents strictly after `after` (or from the first), at most `limit` of them.
+    ///
+    /// Mirrors `keys_after`: a cursor that no longer names an open intent is only a
+    /// position, so a page stays well defined while the bucket is being mutated. Kinds
+    /// are returned as stored, duplicates included, so a caller can tell that a kind
+    /// addresses more than one intent.
+    pub fn open_kind_page(
+        &self,
+        owner: &ContractAddress,
+        after: Option<usize>,
+        limit: usize,
+    ) -> VmrtRes<(Option<usize>, Vec<Vec<u8>>)> {
+        if limit == 0 {
+            return itr_err_fmt!(
+                ItrErrCode::IntentError,
+                "intent open page limit must be positive"
+            );
+        }
+        let Some(bucket) = self.buckets.get(owner) else {
+            return Ok((None, Vec::new()));
+        };
+        let mut ids: Vec<usize> = bucket.keys().copied().collect();
+        ids.sort_unstable();
+        let start = match after {
+            None => 0usize,
+            Some(cursor) => ids.partition_point(|id| *id <= cursor),
+        };
+        let end = start.saturating_add(limit).min(ids.len());
+        let mut kinds = Vec::with_capacity(end.saturating_sub(start));
+        for id in &ids[start..end] {
+            if let Some(entry) = bucket.get(id) {
+                kinds.push(entry.kind.clone());
+            }
+        }
+        let next = if end < ids.len() {
+            Some(ids[end - 1])
+        } else {
+            None
+        };
+        Ok((next, kinds))
     }
 
     fn ensure_unique_batch_keys(&self, keys: &[Value], op: &str) -> VmrtErr {

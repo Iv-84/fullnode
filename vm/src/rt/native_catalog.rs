@@ -57,8 +57,8 @@ macro_rules! native_func_dispatch_packed_match {
 /// How a NativeFunc's single NTFUNC argv slot is filled.
 /// Criterion is the slot's payload, not arity:
 /// - Concat: callee wants a byte string. Compiler `CAT`s (1-arg is passthrough);
-///   interpreter `extract_call_data` (Nil→`[]`; one-layer list of Bytes is deferred
-///   CAT, ≤ `call_data_size`). Hashes, Amount/fold wire, ascii text.
+///   interpreter `extract_call_data` (Nil→`[]`; one-layer list is deferred CAT via
+///   `extract_bytes`, ≤ `call_data_size`). Hashes, Amount/fold wire, ascii text.
 /// - Packed: callee wants structured Values (typed uint/address, Tuple, list argv).
 ///   Compiler uses 0 Nil / 1 Raw / ≥2 Tuple; interpreter `call_packed`.
 ///   `patches` is Packed at argc 1 because the slot is a list, not CAT fragments.
@@ -120,6 +120,17 @@ macro_rules! native_catalog_enum {
                 Ok(Self::try_from_u8(idx)?.gas_of())
             }
 
+            /// Declared return type from the catalog row.
+            ///
+            /// `Nil` means **two different things** depending on the kind:
+            /// - `NativeFunc`: the handler really does return `Value::Nil`, and
+            ///   `finish_ntfunc` enforces the match.
+            /// - `NativeCtl`: `Nil` means *dynamic / unspecified* return type.
+            ///   The handler may return any `ValueTy` (e.g. the intent increment
+            ///   controls widen to the width of the operands involved), so a
+            ///   `Nil` catalog row must **not** be read as "returns `Value::Nil`".
+            ///
+            /// Only a non-`Nil` `rty` means the value has one fixed, known type.
             pub const fn rty_of(&self) -> ValueTy {
                 match self {
                     $( Self::$name => ValueTy::$rty, )+
@@ -173,6 +184,14 @@ macro_rules! native_catalog_enum {
 /// Every row must name Concat or Packed and has a same-named handler in
 /// `vm::native`; dispatch is generated from these rows.
 /// Ctl/env rows keep the 5-field form.
+///
+/// `rty` semantics differ by kind:
+/// - Func rows declare the one type the handler actually returns; the runtime
+///   asserts it in `finish_ntfunc`.
+/// - Ctl rows are metadata only. `rty = Nil` is the marker for a *dynamic /
+///   unspecified* return type (a handler may yield any `ValueTy`), so `Nil`
+///   here does not promise `Value::Nil`. Any non-`Nil` ctl `rty` is a real,
+///   fixed return type.
 macro_rules! native_func_env_define {
     ( func, $EnumName:ident, $ErrCode:ident,
       $( $name:ident = $v:expr, $argv_len:expr, $gas:expr, $rty:ident, $argv_pack:ident )+ ) => {
@@ -215,10 +234,11 @@ macro_rules! native_func_env_define {
                         cty.name()
                     );
                 }
+                let dynamic_gas = crate::native::ntfunc_dynamic_gas(cty, &argv);
                 let r = native_func_dispatch_packed_match!(
                     cty, env, argv; $( $name = $argv_pack )+
                 );
-                crate::native::finish_ntfunc(cty, r)
+                crate::native::finish_ntfunc_with_extra(cty, r, dynamic_gas)
             }
         }
     };
@@ -243,6 +263,16 @@ native_func_env_define! { func, NativeFunc, NativeFuncError,
     blake2s256          = 5,    1,     32,    Bytes,   Concat
     blake2b256          = 6,    1,     32,    Bytes,   Concat
 
+    sha2_prefix_u32     = 32,   1,     25,    U32,     Concat
+    sha2_prefix_u64     = 33,   1,     25,    U64,     Concat
+    sha2_prefix_u160    = 34,   1,     25,    Bytes,   Concat
+
+    verify_signature    = 40,   3,     40,    Bool,    Packed
+    p256_verify         = 41,   3,     40,    Bool,    Packed
+    secp256k1_recover   = 42,   3,     40,    Bytes,   Packed
+    merkle_root         = 43,   5,     16,    Bytes,   Packed
+    merkle_multi_root   = 44,   4,     16,    Bytes,   Packed
+
     hac_to_mei          = 51,   1,      6,    U64,     Concat
     hac_to_mei_checked  = 52,   1,      8,    U64,     Concat
     hac_to_zhu          = 53,   1,      6,    U128,    Concat
@@ -255,15 +285,34 @@ native_func_env_define! { func, NativeFunc, NativeFuncError,
     mei_to_hac          = 60,   1,      6,    Bytes,   Packed
     zhu_to_hac          = 61,   1,      6,    Bytes,   Packed
     unit_to_hac         = 62,   2,      6,    Bytes,   Packed
+    hac_zhu_tail        = 63,   1,      6,    Bytes,   Concat
 
     u64_to_fold64       = 71,   1,      6,    Bytes,   Packed
     fold64_to_u64       = 72,   1,      6,    U64,     Concat
+    address_ptr         = 73,   1,      4,    U8,      Packed
+    patches             = 74,   1,     16,    Bytes,   Packed
+    pack_asset          = 75,   2,      8,    Bytes,   Packed
+    pack_fungible_amount = 76,  2,     12,    Bytes,   Packed
+    asset_meta_fields   = 77,   1,      8,    Tuple,   Packed
+    asset_meta_require  = 78,   4,     10,    Bool,    Packed
+    check_addr_set      = 79,   3,     16,    Bool,    Packed
+    check_hacd_wire     = 80,   2,     10,    Bool,    Packed
 
-    address_ptr         = 81,   1,      4,    U8,      Packed
-    pack_asset          = 82,   2,      8,    Bytes,   Packed
-    patches             = 83,   1,     16,    Bytes,   Packed
+    address_version     = 91,   1,      4,    U8,      Packed
+    is_privkey_unknown  = 92,   1,      4,    Bool,    Packed
+    is_privkey_not_unknown = 93, 1,     4,    Bool,    Packed
+    is_privkey          = 94,   1,      4,    Bool,    Packed
+    is_contract         = 95,   1,      4,    Bool,    Packed
+    is_scriptmh         = 96,   1,      4,    Bool,    Packed
 
-    verify_signature    = 91,   3,     50,    Bool,    Packed
+    buf_u16             = 101, 2,       8,    U16,     Packed
+    buf_u32             = 102, 2,       8,    U32,     Packed
+    buf_u64             = 103, 2,       8,    U64,     Packed
+    buf_address         = 104, 2,       8,    Address, Packed
+    buf_scan_u32        = 105, 5,      12,    Tuple,   Packed
+
+    fee_add_bps_ceil    = 111,   2,     8,    U64,     Packed
+    bitmap_find         = 112,   5,     4,    Tuple,   Packed
 
     ascii_parse_flat_kv = 121, 8,      40,    Tuple,   Packed
     ascii_validate_transform = 122, 3, 24,    Tuple,   Packed
@@ -273,49 +322,55 @@ native_func_env_define! { func, NativeFunc, NativeFuncError,
 }
 
 native_func_env_define! { ctl, NativeCtl, NativeCtlError,
-    defer              = 1,     1,        8,    Nil
-    intent_new         = 21,    1,       32,    Handle
-    intent_use         = 22,    1,        8,    Nil
-    intent_pop         = 23,    0,        8,    Nil
-    intent_is_own_handle = 24,  1,       10,    Bool
-    intent_kind        = 25,    0,        8,    Bytes
-    intent_kind_is     = 26,    1,        8,    Bool
-    intent_destroy     = 27,    0,       10,    Nil
-    intent_destroy_if_empty = 28, 0,     10,    Bool
-    intent_clear       = 29,    0,       10,    Nil
-    intent_len         = 30,    0,       10,    U64
-    intent_has         = 31,    1,       10,    Bool
-    intent_keys        = 32,    0,       16,    Compo
-    intent_keys_page   = 33,    2,       16,    Tuple
-    intent_keys_after  = 34,    2,       16,    Tuple
-    intent_get         = 35,    1,       10,    Nil
-    intent_get_or      = 36,    2,       12,    Nil
-    intent_require     = 37,    1,       10,    Nil
-    intent_require_eq  = 38,    2,       10,    Nil
-    intent_require_absent = 39, 1,       10,    Nil
-    intent_require_many = 40,   1,       16,    Compo
-    intent_require_map = 41,    1,       16,    Compo
-    intent_has_all     = 42,    1,       12,    Bool
-    intent_has_any     = 43,    1,       12,    Bool
-    intent_put         = 44,    2,       20,    Nil
-    intent_put_if_absent = 45,  2,       20,    Bool
-    intent_put_if_absent_or_match = 46, 2, 20,  Bool
-    intent_put_flat_kv   = 47,  1,       24,    Nil
-    intent_replace     = 48,    2,       14,    Nil
-    intent_replace_if  = 49,    3,       16,    Bool
-    intent_rename      = 50,    2,       14,    Nil
-    intent_take        = 51,    1,       12,    Nil
-    intent_take_or     = 52,    2,       14,    Nil
-    intent_take_if     = 53,    2,       14,    Tuple
-    intent_take_many   = 54,    1,       16,    Compo
-    intent_take_map    = 55,    1,       16,    Compo
-    intent_consume     = 56,    1,       14,    Nil
-    intent_consume_many = 57,   1,       16,    Compo
-    intent_del         = 58,    1,       10,    Nil
-    intent_del_if      = 59,    2,       14,    Bool
-    intent_del_many    = 60,    1,       12,    U64
-    intent_append      = 61,    2,       14,    U64
-    intent_inc         = 62,    2,       14,    U64
-    intent_add         = 63,    2,       14,    U64
-    intent_sub         = 64,    2,       14,    U64
+    defer              = 1,     1,       8,    Nil
+    defer_current      = 2,     0,       8,    Nil
+
+    intent_new         = 21,    1,      24,    Handle
+    intent_new_flat_kv = 22,    2,      40,    Handle
+    intent_use         = 23,    1,       8,    Nil
+    intent_use_kind    = 24,    1,       8,    Nil
+    intent_pop         = 25,    0,       8,    Nil
+    intent_bound       = 26,    0,       6,    Bool
+    intent_is_own_handle = 27,  1,       8,    Bool
+    intent_kind        = 28,    0,       6,    Bytes
+    intent_kind_is     = 29,    1,       6,    Bool
+    intent_destroy     = 30,    0,       8,    Nil
+    intent_destroy_if_empty = 31, 0,     8,    Bool
+    intent_clear       = 32,    0,       6,    Nil
+    intent_len         = 33,    0,       6,    U64
+    intent_has         = 34,    1,       6,    Bool
+    intent_keys        = 35,    0,      10,    Compo
+    intent_keys_page   = 36,    2,      10,    Tuple
+    intent_keys_after  = 37,    2,      10,    Tuple
+    intent_get         = 38,    1,       6,    Nil
+    intent_get_or      = 39,    2,       8,    Nil
+    intent_open_page   = 40,    2,      12,    Tuple
+    intent_require     = 41,    1,       6,    Nil
+    intent_require_eq  = 42,    2,       6,    Nil
+    intent_require_absent = 43, 1,       6,    Nil
+    intent_require_many = 44,   1,       8,    Compo
+    intent_require_map = 45,    1,       8,    Compo
+    intent_has_all     = 46,    1,       8,    Bool
+    intent_has_any     = 47,    1,       6,    Bool
+    intent_put         = 48,    2,      12,    Nil
+    intent_put_if_absent = 49,  2,      12,    Bool
+    intent_put_if_absent_or_match = 50, 2, 12, Bool
+    intent_put_flat_kv   = 51,  1,      16,    Nil
+    intent_replace     = 52,    2,       6,    Nil
+    intent_replace_if  = 53,    3,       8,    Bool
+    intent_rename      = 54,    2,       6,    Nil
+    intent_take        = 55,    1,       6,    Nil
+    intent_take_or     = 56,    2,       8,    Nil
+    intent_take_if     = 57,    2,       8,    Tuple
+    intent_take_many   = 58,    1,      10,    Compo
+    intent_take_map    = 59,    1,      10,    Compo
+    intent_consume     = 60,    1,       8,    Nil
+    intent_consume_many = 61,   1,      10,    Compo
+    intent_del         = 62,    1,       6,    Nil
+    intent_del_if      = 63,    2,       8,    Bool
+    intent_del_many    = 64,    1,       6,    U64
+    intent_append      = 65,    2,       8,    U64
+    intent_inc         = 66,    2,       8,    Nil
+    intent_add         = 67,    2,       8,    Nil
+    intent_sub         = 68,    2,       8,    Nil
 }

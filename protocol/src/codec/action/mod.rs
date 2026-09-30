@@ -14,15 +14,16 @@ pub use ast::{
 };
 pub use blob::{Blob, Message};
 pub use envfunc::{
-    BalanceAsset, BalanceCoin, BlockAuthorAddr, CheckSignature, EnvHeight, HacdInscGet,
-    HacdInscNum, HacdNameList, HacdOwnerAddrs, SigsetAtLeast, SigsetCount, TxBlob, TxBlobNum,
-    TxBlobSize, TxMainAddr, TxMessage, TxMessageNum,
+    AssetMeta, BalanceAsset, BalanceCoin, BalanceFungible, BlockAuthorAddr,
+    CheckSignature, EnvHeight, HacdInscGet, HacdInscNum, HacdNameList,
+    HacdOwnerAddrs, SigsetAtLeast, SigsetCount, TxBlob, TxBlobNum, TxBlobSize,
+    TxMainAddr, TxMessage, TxMessageNum, TxMessageSingle,
 };
 pub use guard::{
     guard_facts, height_in_range, BalanceFloor, ChainAllow, GuardFacts, HeightScope,
     RequiredSigners,
 };
-pub use tex::{TexCellExecute, TEX_CELL_SCHEMA};
+pub use tex::{TexCell, TexCellExecute, TEX_CELL_SCHEMA};
 pub use transfer::{
     TransferAssetFrom, TransferAssetFromTo, TransferAssetTo, TransferHacFrom, TransferHacFromTo,
     TransferHacTo, TransferHacdFrom, TransferHacdFromTo, TransferHacdSingleTo, TransferHacdTo,

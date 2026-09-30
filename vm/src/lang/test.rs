@@ -249,7 +249,7 @@ mod token_t {
         let bytecode = lang_to_bytecode(script).expect("Failed to compile memory_once");
         assert!(
             bytecode.contains(&(Bytecode::MONCE as u8)),
-            "Expected MONCE (0x94) in bytecode, got: {:02x?}",
+            "Expected MONCE (0x84) in bytecode, got: {:02x?}",
             bytecode
         );
         let back = irnode_to_lang(lang_to_irnode(script).unwrap()).unwrap();
@@ -269,6 +269,28 @@ mod token_t {
         assert!(
             gst.gas(Bytecode::MONCE as u8) > 1,
             "MONCE must not fall back to the default base gas"
+        );
+    }
+
+    #[test]
+    fn test_memory_patch_compiles_to_mpatch_and_roundtrips() {
+        use super::{irnode_to_lang, lang_to_bytecode, lang_to_irnode};
+        use crate::rt::Bytecode;
+
+        // `patches([...])` is the NTFUNC that builds a canonical patch_set, the same
+        // value SPATCH takes; MPATCH must be reachable through the same call form.
+        let script = "memory_patch('k', 'v', patches([0, 1, 1 as u8]))";
+        let bytecode = lang_to_bytecode(script).expect("Failed to compile memory_patch");
+        assert!(
+            bytecode.contains(&(Bytecode::MPATCH as u8)),
+            "Expected MPATCH (0x86) in bytecode, got: {:02x?}",
+            bytecode
+        );
+        let back = irnode_to_lang(lang_to_irnode(script).unwrap()).unwrap();
+        assert!(
+            back.contains("memory_patch"),
+            "decompiled output lost builtin name: {}",
+            back
         );
     }
 
@@ -419,7 +441,7 @@ mod token_t {
     #[test]
     fn test_codecall_with_argument_emits_argument_push_before_opcode() {
         use super::lang_to_bytecode;
-        use crate::rt::{Bytecode, verify_bytecodes};
+        use crate::rt::{verify_bytecodes, Bytecode};
 
         let codes = lang_to_bytecode("codecall 1.0x01020304(7)").expect("compile failed");
         let marks = verify_bytecodes(&codes).expect("verify failed");
@@ -428,7 +450,7 @@ mod token_t {
             if *mark == 0 {
                 continue;
             }
-            if codes[idx] == Bytecode::CODECALL as u8 {
+            if codes[idx] == Bytecode::CODE_CALL as u8 {
                 codecall_idx = Some(idx);
                 break;
             }
@@ -655,7 +677,7 @@ mod token_t {
     }
 
     fn collect_user_call_opcodes(codes: &[u8]) -> Vec<u8> {
-        use crate::rt::{Bytecode, verify_bytecodes};
+        use crate::rt::{verify_bytecodes, Bytecode};
 
         verify_bytecodes(codes)
             .unwrap()
@@ -668,7 +690,7 @@ mod token_t {
                 let op = codes[idx];
                 let is_call = matches!(
                     op,
-                    x if x == Bytecode::CODECALL as u8
+                    x if x == Bytecode::CODE_CALL as u8
                         || x == Bytecode::CALL as u8
                         || x == Bytecode::CALLEXT as u8
                         || x == Bytecode::CALLEXTVIEW as u8
@@ -749,6 +771,42 @@ mod token_t {
                 Err(e) => println!("FAIL: {} failed: {}", script, e),
             }
         }
+    }
+
+    #[test]
+    fn literal_product_width_follows_result_or_suffix_floor() {
+        use super::{lang_to_bytecode, lang_to_irnode};
+        use crate::rt::Bytecode;
+
+        let narrow = lang_to_bytecode("return 20 * 100").unwrap();
+        assert!(narrow.contains(&(Bytecode::PU16 as u8)));
+        assert!(!narrow.contains(&(Bytecode::MUL as u8)));
+        assert!(!narrow.contains(&(Bytecode::CU64 as u8)));
+
+        let added = lang_to_bytecode("return 20 * 100 + 1").unwrap();
+        assert!(added.contains(&(Bytecode::PU16 as u8)));
+        assert!(!added.contains(&(Bytecode::MUL as u8)));
+        assert!(!added.contains(&(Bytecode::ADD as u8)));
+
+        let chained = lang_to_bytecode("return 20 * 100 * 100").unwrap();
+        assert!(chained.contains(&(Bytecode::CU32 as u8)));
+        assert!(!chained.contains(&(Bytecode::MUL as u8)));
+
+        let wide = lang_to_bytecode("return 20 * 100u64").unwrap();
+        assert!(wide.contains(&(Bytecode::CU64 as u8)));
+        assert!(!wide.contains(&(Bytecode::MUL as u8)));
+
+        let wide_added = lang_to_bytecode("return 20 * 100u64 + 1").unwrap();
+        assert!(wide_added.contains(&(Bytecode::CU64 as u8)));
+        assert!(!wide_added.contains(&(Bytecode::ADD as u8)));
+        assert!(!wide_added.contains(&(Bytecode::MUL as u8)));
+
+        let small = lang_to_bytecode("return 3 * 4").unwrap();
+        assert!(!small.contains(&(Bytecode::MUL as u8)));
+        assert!(!small.contains(&(Bytecode::CU16 as u8)));
+        assert!(!small.contains(&(Bytecode::CU64 as u8)));
+
+        assert!(lang_to_irnode("170141183460469231731687303715884105728 * 2").is_err());
     }
 
     // ==================== Overflow Check Tests ====================
@@ -930,9 +988,9 @@ mod token_t {
 
     #[test]
     fn test_simplify_numeric_as_suffix_option_off_uses_as_cast() {
+        use super::lang_to_irnode;
         use super::Formater;
         use super::PrintOption;
-        use super::lang_to_irnode;
 
         let script = "var x = 100u64";
         let ir = lang_to_irnode(script).expect("Failed to compile");
@@ -956,9 +1014,9 @@ mod token_t {
 
     #[test]
     fn test_hide_default_call_argv_keeps_explicit_empty_bytes_for_ntfunc() {
+        use super::lang_to_irnode;
         use super::Formater;
         use super::PrintOption;
-        use super::lang_to_irnode;
 
         let ir = lang_to_irnode("return sha2(\"\")").expect("Failed to compile");
         let mut opt = PrintOption::new("  ", 0);
@@ -978,9 +1036,9 @@ mod token_t {
 
     #[test]
     fn test_keccak256_roundtrips_as_single_arg_ntfunc() {
+        use super::lang_to_irnode;
         use super::Formater;
         use super::PrintOption;
-        use super::lang_to_irnode;
 
         let ir = lang_to_irnode("return keccak256(\"abc\")").expect("Failed to compile");
         let decompiled = Formater::new(&PrintOption::new("  ", 0)).print(&ir);
@@ -992,10 +1050,28 @@ mod token_t {
     }
 
     #[test]
+    fn crypto_native_calls_compile_with_catalog_arity() {
+        use super::lang_to_irnode;
+
+        assert!(lang_to_irnode("return merkle_root(0, 0, \"leaf\", \"\", 0)").is_ok());
+        assert!(lang_to_irnode("return secp256k1_recover(\"digest\", \"signature\", 0)").is_ok());
+        assert!(lang_to_irnode("return merkle_root(0, 0, \"leaf\", \"\")").is_err());
+        assert!(lang_to_irnode("return secp256k1_recover(\"digest\", \"signature\")").is_err());
+        assert!(
+            lang_to_irnode("return merkle_multi_root(0, \"leaves\", \"proof\", \"flags\")").is_ok()
+        );
+        assert!(
+            lang_to_irnode("return p256_verify(\"digest\", \"signature\", \"public_key\")").is_ok()
+        );
+        assert!(lang_to_irnode("return bitmap_find(\"bitmap\", 0, 8, 1, false)").is_ok());
+        assert!(lang_to_irnode("return bitmap_find(\"bitmap\", 0, 8, 1)").is_err());
+    }
+
+    #[test]
     fn test_blake2s256_roundtrips_as_single_arg_ntfunc() {
+        use super::lang_to_irnode;
         use super::Formater;
         use super::PrintOption;
-        use super::lang_to_irnode;
 
         let ir = lang_to_irnode("return blake2s256(\"abc\")").expect("Failed to compile");
         let decompiled = Formater::new(&PrintOption::new("  ", 0)).print(&ir);
@@ -1008,9 +1084,9 @@ mod token_t {
 
     #[test]
     fn test_blake2b256_roundtrips_as_single_arg_ntfunc() {
+        use super::lang_to_irnode;
         use super::Formater;
         use super::PrintOption;
-        use super::lang_to_irnode;
 
         let ir = lang_to_irnode("return blake2b256(\"abc\")").expect("Failed to compile");
         let decompiled = Formater::new(&PrintOption::new("  ", 0)).print(&ir);
@@ -1023,9 +1099,9 @@ mod token_t {
 
     #[test]
     fn test_hide_default_call_argv_applies_to_ntenv() {
+        use super::lang_to_irnode;
         use super::Formater;
         use super::PrintOption;
-        use super::lang_to_irnode;
 
         let ir = lang_to_irnode("return context_address()").expect("Failed to compile");
         let plain = Formater::new(&PrintOption::new("  ", 0)).print(&ir);
@@ -1046,9 +1122,9 @@ mod token_t {
 
     #[test]
     fn test_hide_default_call_argv_applies_to_ntreg() {
+        use super::lang_to_irnode;
         use super::Formater;
         use super::PrintOption;
-        use super::lang_to_irnode;
 
         let ir = lang_to_irnode("intent_pop()\nreturn 0").expect("Failed to compile");
         let plain = Formater::new(&PrintOption::new("  ", 0)).print(&ir);
@@ -1069,9 +1145,9 @@ mod token_t {
 
     #[test]
     fn test_syscall_single_arg_cat_not_split() {
+        use super::lang_to_irnode;
         use super::Formater;
         use super::PrintOption;
-        use super::lang_to_irnode;
 
         let ir = lang_to_irnode("return sha2(\"a\" ++ \"b\")").expect("Failed to compile");
         let mut opt = PrintOption::new("  ", 0);
@@ -1097,7 +1173,7 @@ mod token_t {
         use crate::rt::NativeArgvPack;
         use crate::rt::NativeFunc;
 
-        assert_eq!(NativeFunc::pack_asset as u8, 82);
+        assert_eq!(NativeFunc::pack_asset as u8, 75);
         assert_eq!(
             NativeFunc::argv_pack(NativeFunc::pack_asset as u8).unwrap(),
             NativeArgvPack::Packed
@@ -1150,10 +1226,35 @@ mod token_t {
     }
 
     #[test]
+    fn address_inspection_natives_compile_as_packed() {
+        use super::lang_to_bytecode;
+        use super::lang_to_irnode;
+        use crate::rt::Bytecode;
+
+        for call in [
+            "address_version(a)",
+            "is_privkey_unknown(a)",
+            "is_privkey_not_unknown(a)",
+            "is_privkey(a)",
+            "is_contract(a)",
+            "is_scriptmh(a)",
+        ] {
+            let script = format!("var a = emqjNS9PscqdBpMtnC3Jfuc4mvZUPYTPS\nreturn {}", call);
+            lang_to_irnode(&script).unwrap_or_else(|e| panic!("{} must compile: {}", call, e));
+            let codes = lang_to_bytecode(&script).expect("bytecode");
+            assert!(
+                codes.contains(&(Bytecode::NTFUNC as u8)),
+                "{}: must compile to NTFUNC dispatch",
+                call
+            );
+        }
+    }
+
+    #[test]
     fn test_syscall_multi_arg_packed_decompiles_as_two_args() {
+        use super::lang_to_irnode;
         use super::Formater;
         use super::PrintOption;
-        use super::lang_to_irnode;
 
         let ir = lang_to_irnode("return pack_asset(1, 2)").expect("Failed to compile");
 
@@ -1277,10 +1378,10 @@ mod token_t {
 
     #[test]
     fn test_all_print_options_disabled_preserve_ircode_semantics() {
-        use super::Formater;
-        use super::PrintOption;
         use super::lang_to_ircode;
         use super::lang_to_irnode_with_sourcemap;
+        use super::Formater;
+        use super::PrintOption;
 
         let script = r#"
             param { amt }
@@ -1327,9 +1428,9 @@ mod token_t {
 
     #[test]
     fn patches_list_literal_roundtrips_without_flattening_concat_args() {
+        use super::lang_to_irnode;
         use super::Formater;
         use super::PrintOption;
-        use super::lang_to_irnode;
 
         let ir = lang_to_irnode("return patches([0, 1, 1 as u8])").expect("compile patches");
         let mut opt = PrintOption::new("  ", 0);
@@ -1383,9 +1484,9 @@ mod token_t {
     }
 
     fn print_sigset_call(src: &str) -> String {
+        use super::lang_to_irnode;
         use super::Formater;
         use super::PrintOption;
-        use super::lang_to_irnode;
 
         let ir = lang_to_irnode(src).expect(src);
         let mut opt = PrintOption::new("  ", 0);
@@ -1496,5 +1597,220 @@ mod token_t {
             lang_to_irnode(r#"return sigset_at_least("a", "b", "c")"#).is_err(),
             "three-arg sigset_at_least must fail"
         );
+    }
+
+    #[test]
+    fn first_put_without_sourcemap_prints_single_slot_alias() {
+        use super::format_ircode_to_lang;
+        use super::lang_to_ircode;
+
+        let src = "var a = 1\nreturn a";
+        let ir = lang_to_ircode(src).expect(src);
+        let text = format_ircode_to_lang(&ir, None).expect(src);
+        assert!(
+            !text.contains("$0 $0"),
+            "decompiler must not duplicate the slot alias, got:\n{text}"
+        );
+        assert!(
+            text.contains("var $0 ="),
+            "expected `var $0 = ...`, got:\n{text}"
+        );
+        let reparsed = lang_to_ircode(&text).expect(&text);
+        assert_eq!(ir, reparsed, "decompiled:\n{text}");
+    }
+
+    #[test]
+    fn first_put_with_sourcemap_keeps_name_and_explicit_slot() {
+        use super::format_ircode_to_lang;
+        use super::lang_to_ircode_with_sourcemap;
+
+        let src = "var a = 1\nreturn a";
+        let (ir, smap) = lang_to_ircode_with_sourcemap(src).expect(src);
+        let text = format_ircode_to_lang(&ir, Some(&smap)).expect(src);
+        assert!(
+            text.contains("a $0 ="),
+            "named first-bind must keep the explicit slot, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn var_slot_alias_name_binds_that_slot() {
+        use super::lang_to_ircode;
+
+        let named = lang_to_ircode("var a $5 = 1\nreturn $5").expect("named");
+        let aliased = lang_to_ircode("var $5 = 1\nreturn $5").expect("aliased");
+        assert_eq!(named, aliased);
+    }
+
+    #[test]
+    fn new_intent_ctl_surface_compiles_and_checks_arity() {
+        use super::lang_to_irnode;
+        use super::Formater;
+        use super::PrintOption;
+
+        let accepted = [
+            "intent_use_kind(1)\nreturn 0",
+            "intent_bound()\nreturn 0",
+            "defer_current()\nreturn 0",
+            "intent_open_page(nil, 8)\nreturn 0",
+        ];
+        for src in accepted {
+            let ir = lang_to_irnode(src).expect(src);
+            let text = Formater::new(&PrintOption::new("  ", 0)).print(&ir);
+            let name = src.split('(').next().unwrap();
+            assert!(
+                text.contains(&format!("{name}(")),
+                "decompiled source lost `{name}`, got:\n{text}"
+            );
+        }
+
+        let rejected = [
+            "intent_use_kind()\nreturn 0",
+            "intent_use_kind(1, 2)\nreturn 0",
+            "intent_bound(1)\nreturn 0",
+            "defer_current(nil)\nreturn 0",
+            "intent_open_page(nil)\nreturn 0",
+        ];
+        for src in rejected {
+            assert!(
+                lang_to_irnode(src).is_err(),
+                "expected arity error for {src}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod ternary_t {
+    use crate::rt::Token;
+    use crate::IRNode;
+
+    fn assert_ternary_matches_choose(ternary: &str, choose: &str) {
+        use super::{lang_to_bytecode, lang_to_irnode};
+        let ir_t = lang_to_irnode(ternary).unwrap_or_else(|e| panic!("{ternary}: {e}"));
+        let ir_c = lang_to_irnode(choose).unwrap_or_else(|e| panic!("{choose}: {e}"));
+        assert_eq!(
+            ir_t.serialize(),
+            ir_c.serialize(),
+            "serialize mismatch:\n  {ternary}\n  {choose}"
+        );
+        let bc_t = lang_to_bytecode(ternary).unwrap_or_else(|e| panic!("bc {ternary}: {e}"));
+        let bc_c = lang_to_bytecode(choose).unwrap_or_else(|e| panic!("bc {choose}: {e}"));
+        assert_eq!(bc_t, bc_c, "bytecode mismatch:\n  {ternary}\n  {choose}");
+    }
+
+    #[test]
+    fn ternary_compiles() {
+        use super::lang_to_irnode;
+        lang_to_irnode("return true ? 1 : 2").expect("true ? 1 : 2");
+    }
+
+    #[test]
+    fn ternary_matches_choose_ir_and_bytecode() {
+        assert_ternary_matches_choose("return true ? 1 : 2", "return choose(true, 1, 2)");
+    }
+
+    #[test]
+    fn ternary_precedence_lower_than_add() {
+        use super::{lang_to_bytecode, lang_to_irnode};
+        assert_ternary_matches_choose("return 1 + 2 ? 3 : 4", "return choose(1 + 2, 3, 4)");
+        let add_choose = lang_to_irnode("return 1 + choose(2, 3, 4)").unwrap();
+        let ternary = lang_to_irnode("return 1 + 2 ? 3 : 4").unwrap();
+        assert_ne!(add_choose.serialize(), ternary.serialize());
+        assert_ne!(
+            lang_to_bytecode("return 1 + choose(2, 3, 4)").unwrap(),
+            lang_to_bytecode("return 1 + 2 ? 3 : 4").unwrap()
+        );
+    }
+
+    #[test]
+    fn ternary_right_associative() {
+        assert_ternary_matches_choose(
+            "return false ? 1 : true ? 2 : 3",
+            "return choose(false, 1, choose(true, 2, 3))",
+        );
+    }
+
+    #[test]
+    fn ternary_true_branch_identifier_not_colon_call() {
+        lang_to_irnode_ok("var a = 1\nvar b = 2\nreturn true ? a : b");
+        assert_ternary_matches_choose(
+            "var a = 1\nvar b = 2\nreturn true ? a : b",
+            "var a = 1\nvar b = 2\nreturn choose(true, a, b)",
+        );
+    }
+
+    fn lang_to_irnode_ok(src: &str) {
+        super::lang_to_irnode(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+    }
+
+    #[test]
+    fn tokenizer_accepts_question_mark() {
+        let tokens = super::Tokenizer::new(b"true ? 1 : 2")
+            .parse()
+            .expect("tokenize ?");
+        assert!(
+            tokens.iter().any(|t| matches!(t, Token::Partition('?'))),
+            "expected '?' partition token, got {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn ternary_missing_colon_is_error() {
+        let err = super::lang_to_irnode("return 1 ? 2")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("missing ':'"),
+            "expected missing-colon error, got {err}"
+        );
+    }
+
+    #[test]
+    fn ternary_decompile_prints_question_colon() {
+        use super::{irnode_to_lang, lang_to_irnode};
+        let ir = lang_to_irnode("return choose(true, 1, 2)").unwrap();
+        let text = irnode_to_lang(ir).unwrap();
+        assert!(text.contains('?'), "decompiled should use ternary: {text}");
+        assert!(
+            !text.contains("choose("),
+            "decompiled should not keep choose(): {text}"
+        );
+    }
+
+    #[test]
+    fn ternary_operand_wrapping_roundtrips() {
+        use super::{ircode_to_lang, lang_to_ircode};
+        for src in [
+            "return (true ? 1 : 2) + 3",
+            "return 1 + 2 ? 3 : 4",
+            "return true ? 1 + 2 : 3",
+            "return true ? 1 : 2 + 3",
+            "return false ? 1 : true ? 2 : 3",
+            "return (false ? 1 : true) ? 2 : 3",
+            "return !(true ? true : false)",
+            "return true ? false ? 1 : 2 : 3",
+        ] {
+            let expect = lang_to_ircode(src).expect(src);
+            let text = ircode_to_lang(&expect).expect(src);
+            let reparsed = lang_to_ircode(&text)
+                .unwrap_or_else(|e| panic!("{src}\n---- decompiled ----\n{text}\n{e}"));
+            assert_eq!(expect, reparsed, "src={src}\ndecompiled={text}");
+        }
+    }
+
+    #[test]
+    fn ternary_true_branch_nested() {
+        assert_ternary_matches_choose(
+            "return true ? false ? 1 : 2 : 3",
+            "return choose(true, choose(false, 1, 2), 3)",
+        );
+    }
+
+    #[test]
+    fn ternary_and_choose_both_compile() {
+        lang_to_irnode_ok("return true ? choose(false, 1, 2) : 3");
+        lang_to_irnode_ok("return choose(true, 1, false ? 2 : 3)");
     }
 }

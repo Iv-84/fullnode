@@ -151,19 +151,7 @@ pub fn init_block_contract_storage_budget(
     let record = read_contract_storage_budget(&*layer)?;
     let start = match record {
         None => {
-            if height != storage.activation_height {
-                return Err(budget_fatal(format!(
-                    "budget record missing at height {height} (H0 {})",
-                    storage.activation_height
-                )));
-            }
-            // First activation block starts with the full budget (B0 = C): every
-            // pre-H0 deploy paid the enforced full price, so the mechanism behaves
-            // as if it had been active — and unused — since genesis. The record is
-            // born saturated, which makes the budget trajectory independent of the
-            // activation height: a pure C/R/D token bucket that a later release can
-            // manage without any H0 gate (a missing record then simply means the
-            // mechanism never spent anything).
+            // Missing record: the bucket never spent anything (`B0 = C`).
             capacity
         }
         Some(record) => {
@@ -248,7 +236,7 @@ pub fn read_block_contract_storage_snapshot(
 }
 
 /// Best-effort budget read for quoting/analysis (§8.D): `Ok(None)` when the
-/// mechanism is inactive or the caller is outside a block execution layer (no
+/// mechanism is disabled or the caller is outside a block execution layer (no
 /// `B_start` snapshot installed yet). Unlike [`read_block_contract_storage_snapshot`]
 /// this never aborts on a missing transient key, so offline analysis can quote the
 /// full price without knowing the head budget. Transient-key decode failures still
@@ -258,10 +246,25 @@ pub fn peek_block_budget_remaining(
     vp: &VmExecutionParams,
     height: u64,
 ) -> Ret<Option<u128>> {
+    Ok(peek_block_contract_storage_snapshot(read, vp, height)?.map(|s| s.remaining_start))
+}
+
+/// Best-effort block snapshot for quoting. Same absence rules as
+/// [`peek_block_budget_remaining`]: disabled profiles and a missing `B_start` are
+/// `Ok(None)`. Once `B_start` is present, `D` and the quota bounds are validated
+/// exactly like [`read_block_contract_storage_snapshot`].
+pub fn peek_block_contract_storage_snapshot(
+    read: &dyn StateRead,
+    vp: &VmExecutionParams,
+    height: u64,
+) -> Ret<Option<ContractStorageBlockSnapshot>> {
     if !vp.contract_storage_fee.is_active_at(height) {
         return Ok(None);
     }
-    read_u128_transient(read, BLOCK_BUDGET_START_KEY)
+    if read_u128_transient(read, BLOCK_BUDGET_START_KEY)?.is_none() {
+        return Ok(None);
+    }
+    read_block_contract_storage_snapshot(read, vp, height)
 }
 
 /// Consume `charge_bytes` of block discount quota for one whole transaction (§4.3
@@ -352,10 +355,9 @@ pub fn settle_block_contract_storage_budget(
     Ok(Some(settlement))
 }
 
-/// Post-block state verification (§C6): the transient keys must be gone, and from
-/// `H0` onward the persisted record must exist, decode, and satisfy `B <= C` with the
-/// record capacity matching the active schedule. Missing/extra records at the
-/// activation boundary are lifecycle bugs, not user errors.
+/// Post-block state verification (§C6): the transient keys must be gone. Disabled
+/// profiles must not persist a budget record; enabled profiles must have a record
+/// that decodes and satisfies `B <= C` with capacity matching the active schedule.
 pub fn verify_block_contract_storage_state(
     read: &dyn StateRead,
     vp: &VmExecutionParams,
@@ -368,10 +370,10 @@ pub fn verify_block_contract_storage_state(
     if read_u128_transient(read, BLOCK_BUDGET_USED_KEY)?.is_some() {
         return Err(budget_fatal("transient budget used key leaked into settled state"));
     }
-    if !storage.is_active_at(height) {
+    if storage.is_disabled() {
         if read_contract_storage_budget(read)?.is_some() {
             return Err(budget_fatal(
-                "budget record exists before activation height",
+                "budget record exists while discount is disabled",
             ));
         }
         return Ok(());
@@ -428,7 +430,7 @@ pub struct ContractStorageFeeFacts {
 }
 
 /// Compute observability facts from the head budget record at `height` (the height
-/// the next produced block will execute at). Pre-activation profiles report
+/// the next produced block will execute at). Disabled profiles report
 /// `enabled = false` with legacy full price.
 pub fn contract_storage_fee_facts(
     read: &dyn StateRead,
@@ -462,7 +464,7 @@ pub fn contract_storage_fee_facts(
     let rate = u128::from(storage.active_rate(height).unwrap_or(0));
     let record = read_contract_storage_budget(read)?;
     let remaining = match record {
-        None => 0,
+        None => capacity,
         Some(record) => {
             let applied = record.applied_capacity_bytes.uint();
             if capacity < applied {
@@ -584,20 +586,19 @@ mod tests {
         StateChunkRef::new_root(Arc::new(NoDisk), block(0, Hash::default()))
     }
 
-    /// Mainnet-shaped profile from §3.1 with H0 = 10_000 so tests can cheaply
-    /// climb over the whole activation period. Fee purity floor in the chain
+    /// Mainnet-shaped profile from §3.1. Fee purity floor in the chain
     /// pricing unit (u232): 5×10¹⁰ = the legacy 50,000 u238/byte equivalent.
     fn mainnet_like_params() -> VmExecutionParams {
         VmExecutionParams {
             contract_store_perm_periods: 10_000,
             contract_storage_fee: ContractStorageFeeParams {
                 rule_version: CONTRACT_STORAGE_RULE_V1,
-                activation_height: 10_000,
+                activation_height: 0,
                 target_capacity_blocks: 1_000,
                 curve_steps: 1_000,
                 period_floor: 10,
                 max_block_discount_bytes: 16_384,
-                supplement_schedule: &[(10_000, 1_000)],
+                supplement_schedule: &[(0, 1_000)],
             },
             initial_fee_purity_floor: 50_000_000_000,
             fee_purity_reductions: &[],
@@ -668,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_profile_and_pre_activation_are_legacy_noops() {
+    fn disabled_profile_is_a_legacy_noop() {
         let root = root();
         let vp_disabled = VmExecutionParams {
             contract_storage_fee: ContractStorageFeeParams::disabled(),
@@ -681,12 +682,6 @@ mod tests {
         assert!(read_contract_storage_budget(&b).unwrap().is_none());
         // the transient keys must not leak even in a no-op lifecycle
         assert!(b.get(BLOCK_BUDGET_START_KEY).unwrap().is_none());
-
-        // pre-activation heights keep the legacy rule too
-        let vp = mainnet_like_params();
-        let mut b2 = StateChunkRef::block_draft_on(&root, 9_999);
-        assert!(init_block_contract_storage_budget(&mut b2, &vp, 9_999).unwrap().is_none());
-        verify_block_contract_storage_state(&b2, &vp, 9_999).unwrap();
     }
 
     /// §9 row: `H0` with a missing budget record → `B_start = C` (B0 = C): the
@@ -928,10 +923,14 @@ mod tests {
         };
         let err = verify_block_contract_storage_state(&b3, &shrunk, 10_001);
         assert!(err.is_err());
-        // records before activation are rejected
+        // leftover records on a disabled profile are rejected
+        let vp_disabled = VmExecutionParams {
+            contract_storage_fee: ContractStorageFeeParams::disabled(),
+            ..vp
+        };
         let mut b4 = StateChunkRef::block_exec_on(&root, block(1, Hash::from([6; 32])), ForkChoiceKey::from_height(1)).unwrap();
         b4.set(&[KEY_CONTRACT_STORAGE_BUDGET], vec![1, 0, 0]);
-        let err = verify_block_contract_storage_state(&b4, &vp, 1);
+        let err = verify_block_contract_storage_state(&b4, &vp_disabled, 1);
         assert!(err.is_err());
     }
 
@@ -1076,6 +1075,25 @@ mod tests {
     }
 
     #[test]
+    fn facts_at_activation_without_record_start_full() {
+        let root = root();
+        let vp = mainnet_like_params();
+        let facts = contract_storage_fee_facts(&root, &vp, 10_000).unwrap();
+        assert!(facts.enabled);
+        assert_eq!(facts.remaining, 1_000_000);
+        assert_eq!(facts.periods, 10);
+        assert_eq!(facts.next_block_quota, 16_384);
+        let q = contract_storage_fee_quote(&root, &vp, 10_000, 1_000).unwrap();
+        assert_eq!(q.discount_u232, Some(50_000_000_000u128 * 1_000 * 10));
+        let q_over = contract_storage_fee_quote(&root, &vp, 10_000, 20_000).unwrap();
+        assert_eq!(q_over.discount_u232, None);
+        let facts_after = contract_storage_fee_facts(&root, &vp, 10_001).unwrap();
+        assert!(facts_after.enabled);
+        assert_eq!(facts_after.remaining, 1_000_000);
+        assert_eq!(facts_after.periods, 10);
+    }
+
+    #[test]
     fn quote_reports_full_and_discount_tiers() {
         let root = root();
         let vp = mainnet_like_params();
@@ -1084,31 +1102,37 @@ mod tests {
         // near-drained head fabricated on top: B = 1,000 against C = 1,000,000
         let tip = fabricate_record_head(&full_tip, 10_001, 1_000, 1_000_000);
         let height = 10_002;
-        let charge = 10_000u64;
-        let q = contract_storage_fee_quote(&tip, &vp, height, charge).unwrap();
-        // full price: 5×10¹⁰ u232/byte × 10,000 bytes × 10,000 periods
+        let q = contract_storage_fee_quote(&tip, &vp, height, 1_000).unwrap();
+        // full price: 5×10¹⁰ u232/byte × 1,000 bytes × 10,000 periods
         assert_eq!(q.floor_purity, 50_000_000_000);
-        assert_eq!(q.full_u232, 50_000_000_000u128 * 10_000 * 10_000);
+        assert_eq!(q.full_u232, 50_000_000_000u128 * 1_000 * 10_000);
         // discount at the head remaining 1000 bytes: step = ceil(1000·999k/1M) = 999
-        // → periods = step × P_min = 9,990 (near full, budget nearly drained)
+        // → periods = step × P_min = 9,990 (near full, budget nearly drained).
+        // The charge equals K = min(B, K_max), so the discount is still grantable.
         let p = vp.contract_storage_fee
             .discount_periods(1_000, 1_000_000, 10_000)
             .unwrap();
         assert_eq!(p, 9_990);
         assert_eq!(
             q.discount_u232,
-            Some(50_000_000_000u128 * 10_000 * p as u128)
+            Some(50_000_000_000u128 * 1_000 * p as u128)
         );
+        let q_over = contract_storage_fee_quote(&tip, &vp, height, 10_000).unwrap();
+        assert_eq!(q_over.full_u232, 50_000_000_000u128 * 10_000 * 10_000);
+        assert_eq!(q_over.discount_u232, None);
         // the full-budget activation head quotes the 10-period floor discount
-        let q_full = contract_storage_fee_quote(&full_tip, &vp, 10_001, charge).unwrap();
+        let q_full = contract_storage_fee_quote(&full_tip, &vp, 10_001, 10_000).unwrap();
         assert_eq!(
             q_full.discount_u232,
             Some(50_000_000_000u128 * 10_000 * 10)
         );
-        // pre-activation heights quote full price only
-        let q_off = contract_storage_fee_quote(&tip, &vp, 9_999, charge).unwrap();
-        assert_eq!(q_off.discount_u232, None);
-        assert_eq!(q_off.full_u232, q.full_u232);
+        // a missing record at any enabled height quotes the unused full bucket
+        let q_missing = contract_storage_fee_quote(&root, &vp, 9_999, 1_000).unwrap();
+        assert_eq!(
+            q_missing.discount_u232,
+            Some(50_000_000_000u128 * 1_000 * 10)
+        );
+        assert_eq!(q_missing.full_u232, q.full_u232);
     }
 
     #[test]
@@ -1149,10 +1173,11 @@ mod tests {
         assert!(facts_full.enabled);
         assert_eq!(facts_full.remaining, 1_000_000);
         assert_eq!(facts_full.periods, 10);
-        // full-price facts before activation
-        let facts_off = contract_storage_fee_facts(&full_tip, &vp, 9_999).unwrap();
-        assert!(!facts_off.enabled);
-        assert_eq!(facts_off.periods, 10_000);
+        // missing record on an enabled profile is the unused full bucket
+        let facts_missing = contract_storage_fee_facts(&root, &vp, 9_999).unwrap();
+        assert!(facts_missing.enabled);
+        assert_eq!(facts_missing.remaining, 1_000_000);
+        assert_eq!(facts_missing.periods, 10);
     }
 }
 
@@ -1171,8 +1196,8 @@ pub struct ContractStorageFeeQuote {
     pub discount_u232: Option<u128>,
 }
 
-/// State-aware quote over a settled head read. `enabled=false` profiles (and
-/// pre-activation heights) quote the full price only.
+/// State-aware quote over a settled head read. Disabled profiles quote the full
+/// price only.
 pub fn contract_storage_fee_quote(
     read: &dyn StateRead,
     vp: &VmExecutionParams,
@@ -1193,7 +1218,9 @@ pub fn contract_storage_fee_quote(
             .ok_or_else(|| budget_fatal("storage fee quote overflow"))
     };
     let full_u232 = scale(facts.max_periods)?;
-    let discount_u232 = if facts.enabled {
+    // The next block starts at D = 0, so the grantable discount is `next_block_quota`
+    // (`K`). A charge that cannot fit is not a discount quote.
+    let discount_u232 = if facts.enabled && bytes <= facts.next_block_quota {
         Some(scale(facts.periods)?)
     } else {
         None
@@ -1222,12 +1249,12 @@ mod economic_sim_tests {
             contract_store_perm_periods: 10_000,
             contract_storage_fee: ContractStorageFeeParams {
                 rule_version: CONTRACT_STORAGE_RULE_V1,
-                activation_height: 784_000,
+                activation_height: 0,
                 target_capacity_blocks: 1_000,
                 curve_steps: 1_000,
                 period_floor: 10,
                 max_block_discount_bytes: 16_384,
-                supplement_schedule: &[(784_000, 1_000)],
+                supplement_schedule: &[(0, 1_000)],
             },
             initial_fee_purity_floor: 50_000_000_000,
             fee_purity_reductions: &[],

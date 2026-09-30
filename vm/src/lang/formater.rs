@@ -684,7 +684,7 @@ impl<'a> Formater<'a> {
         let pss = node.as_any().downcast_ref::<IRNodeParamsSingle>()?;
         if !matches!(
             code,
-            CODECALL
+            CODE_CALL
                 | CALL
                 | CALLEXT
                 | CALLEXTVIEW
@@ -701,7 +701,7 @@ impl<'a> Formater<'a> {
         let pre = self.line_prefix();
         let args = self.build_call_args(&*pss.subx, false, None);
         let use_short_syntax = self.opt.call_short_syntax && self.opt.trim_root_block;
-        if code == CODECALL && use_short_syntax {
+        if code == CODE_CALL && use_short_syntax {
             let CallSpec::Splice { lib, selector } = decode_splice_body(&pss.para).ok()? else {
                 return None;
             };
@@ -721,7 +721,7 @@ impl<'a> Formater<'a> {
             return Some(format!("{}{}", pre, body));
         }
         if code == CALL
-            || matches!(code, CODECALL | CALLSELFVIEW | CALLSELFPURE)
+            || matches!(code, CODE_CALL | CALLSELFVIEW | CALLSELFPURE)
             || !use_short_syntax
         {
             let call = decode_user_call_site(code, &pss.para).ok()?;
@@ -859,7 +859,7 @@ impl<'a> Formater<'a> {
                     // operand must be parenthesized to preserve semantics.
                     let need_wrap = {
                         let lv = s.subx.level();
-                        lv > 0 && lv < OpTy::NOT.level()
+                        (lv > 0 && lv < OpTy::NOT.level()) || Self::is_choose_node(&*s.subx)
                     };
                     if need_wrap {
                         let t = substr.trim();
@@ -900,17 +900,17 @@ impl<'a> Formater<'a> {
         }
         if let Some(t) = node.as_any().downcast_ref::<IRNodeTriple>() {
             if t.inst == Bytecode::CHOOSE {
-                // CHOOSE keeps source/runtime order as (cond, yes, no).
-                let cond = self.print_inline(&*t.subx);
-                let yes = self.print_inline(&*t.suby);
+                // Canonical source form is `cond ? yes : no` (same IR as choose()).
+                let mut cond = self.print_inline(&*t.subx);
+                let mut yes = self.print_inline(&*t.suby);
                 let no = self.print_inline(&*t.subz);
-                return Some(format!(
-                    "{}choose({}, {}, {})",
-                    self.line_prefix(),
-                    cond,
-                    yes,
-                    no
-                ));
+                if Self::is_choose_node(&*t.subx) {
+                    cond = Self::wrap_printed_expr(cond);
+                }
+                if Self::ternary_true_branch_needs_wrap(&*t.suby, &yes) {
+                    yes = Self::wrap_printed_expr(yes);
+                }
+                return Some(format!("{}{} ? {} : {}", self.line_prefix(), cond, yes, no));
             }
             if t.inst == IRIF || t.inst == IRIFR {
                 let subxstr = self.print_inline(&*t.subx);
@@ -994,6 +994,35 @@ impl<'a> Formater<'a> {
                 .as_any()
                 .downcast_ref::<IRNodeSingle>()
                 .is_some_and(|inner| inner.inst == Bytecode::NOT)
+            || Self::is_choose_node(node)
+    }
+
+    fn is_choose_node(node: &dyn IRNode) -> bool {
+        node.as_any()
+            .downcast_ref::<IRNodeTriple>()
+            .is_some_and(|t| t.inst == Bytecode::CHOOSE)
+    }
+
+    fn wrap_printed_expr(s: String) -> String {
+        let t = s.trim();
+        if t.starts_with('(') && t.ends_with(')') {
+            s
+        } else {
+            format!("({})", t)
+        }
+    }
+
+    fn ternary_true_branch_needs_wrap(node: &dyn IRNode, printed: &str) -> bool {
+        if node.as_any().downcast_ref::<IRNodeWrapOne>().is_some() {
+            return false;
+        }
+        let t = printed.trim();
+        if t.starts_with('(') && t.ends_with(')') {
+            return false;
+        }
+        // View/ext `id:sel` calls would steal the ternary colon; nested `?:`
+        // is parenthesized so recompile stays stable.
+        printed.contains(':')
     }
 
     fn format_is_components(&self, node: &dyn IRNode) -> Option<(String, String)> {
@@ -1093,7 +1122,14 @@ impl<'a> Formater<'a> {
                         );
                         let name = self.slot_name_display(node.para);
                         let slot_id_str = format!("${}", node.para);
-                        format!("{} {} {}", prefix, name, slot_id_str)
+                        // Grammar is `var <name> [$slot]? = value`. Without a
+                        // sourcemap the display name is already `$n`; repeating
+                        // the slot alias would print `var $0 $0 = 1`.
+                        if name == slot_id_str {
+                            format!("{} {}", prefix, name)
+                        } else {
+                            format!("{} {} {}", prefix, name, slot_id_str)
+                        }
                     },
                     self.slot_name_display(node.para)
                 );
@@ -1306,7 +1342,7 @@ impl<'a> Formater<'a> {
             PBUF | PBUFL => {
                 buf.push_str(&self.format_data_bytes(node));
             }
-            CODECALL => match decode_splice_body(&node.para) {
+            CODE_CALL => match decode_splice_body(&node.para) {
                 Ok(CallSpec::Splice { lib, selector }) => buf.push_str(&format!(
                     "codecall {}.{}",
                     self.format_lib_chain_ref(lib),
@@ -1339,7 +1375,7 @@ impl<'a> Formater<'a> {
         }
         if let Some(bytecodes) = node.as_any().downcast_ref::<IRNodeBytecodes>() {
             let buf = self.opt.indent.repeat(self.opt.tab);
-            let codes = match bytecodes.codes.bytecode_print(false) {
+            let codes = match crate::rt::disassemble_bytecode_raw(&bytecodes.codes) {
                 Ok(s) => s.trim_end().to_owned(),
                 Err(_) => format!("0x{}", hex::encode(&bytecodes.codes)),
             };
@@ -1650,14 +1686,16 @@ impl<'a> Formater<'a> {
         // Parenthesize children to preserve the original IR tree semantics.
         // - For left-associative ops, wrap the right child on equal precedence.
         // - For right-associative ops (currently only `**`), wrap the left child on equal precedence.
-        let need_wrap_left =
-            clv > 0 && llv > 0 && !wrapx && (clv > llv || (is_right_assoc && clv == llv));
+        let need_wrap_left = !wrapx
+            && ((clv > 0 && llv > 0 && (clv > llv || (is_right_assoc && clv == llv)))
+                || Self::is_choose_node(&*dbl.subx));
         if need_wrap_left {
             subx = format!("({})", &subx);
         }
 
-        let need_wrap_right =
-            clv > 0 && rlv > 0 && !wrapy && (clv > rlv || (!is_right_assoc && clv == rlv));
+        let need_wrap_right = !wrapy
+            && ((clv > 0 && rlv > 0 && (clv > rlv || (!is_right_assoc && clv == rlv)))
+                || Self::is_choose_node(&*dbl.suby));
         if need_wrap_right {
             suby = format!("({})", &suby);
         }

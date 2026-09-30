@@ -63,9 +63,10 @@ fn contract_deploy_execute(this: &ContractDeploy, ctx: &mut dyn Context) -> Rerr
         return errf!("contract content cannot be empty");
     }
     let charge_bytes = contract_deploy_charge_bytes(&this.contract);
-    // Spend the protocol fee through the unified storage fee boundary: legacy fixed
-    // periods before activation, two-phase full/discount classification after (§4.3);
-    // fast-sync skips the checks but books quota identically (state convergence).
+    // Spend the protocol fee through the unified storage fee boundary: two-phase
+    // full/discount classification when enabled, legacy fixed periods when disabled
+    // (§4.3); fast-sync skips the checks but books quota identically (state
+    // convergence).
     enforce_contract_storage_fee(ctx, charge_bytes, &this.protocol_cost)?;
     if !fast_sync || this.protocol_cost.is_positive() {
         // strict deducts after the fee check; fast-sync replay still deducts the
@@ -220,7 +221,7 @@ pub fn analyze_contract_store(
     check_contract_self_reference(root_addr, root_contract)?;
     let mut vmsta = VMState::wrap(ctx.layer());
     check_link_contracts_exist(&mut vmsta, root_addr, root_contract)?;
-    check_inherits_direct_parents_flat(&mut vmsta, root_addr, root_contract)?;
+    check_static_inherit_parents(&mut vmsta, root_addr, root_contract)?;
     let has_construct =
         detect_effective_abst_presence(&mut vmsta, root_addr, root_contract, AbstCall::Construct)?;
     check_static_call_targets(&mut vmsta, root_addr, root_contract, gst)?;
@@ -278,9 +279,10 @@ pub fn analyze_contract_update(
 /// Read-only two-tier storage fee quote for one deploy/update payload (§8.D):
 /// `full_price` guarantees inclusion regardless of quota contention; `discount`
 /// is the best-effort price under the budget visible from the caller's layer and
-/// is present only when the mechanism is active and a live budget snapshot is in
-/// scope (block/pending execution). Analysis/tooling outside a block context gets
-/// `discount = None` and must quote `full_price` (or fetch the head budget facts).
+/// is present only when the mechanism is active, a live budget snapshot is in
+/// scope, and `charge_bytes` still fits the remaining block quota `K - D`.
+/// Analysis/tooling outside a block context gets `discount = None` and must quote
+/// `full_price` (or fetch the head budget facts).
 pub fn quote_contract_storage_fee(
     ctx: &mut dyn Context,
     charge_bytes: usize,
@@ -292,16 +294,18 @@ pub fn quote_contract_storage_fee(
     let height = ctx.env().block.height;
     let p_max = vp.contract_store_perm_periods;
     let full_price = calc_contract_protocol_cost_min_with_periods(ctx, charge_bytes, p_max)?;
-    let discount = match base::peek_block_budget_remaining(ctx.layer(), &vp, height)? {
-        Some(remaining) => {
-            let capacity = vp.contract_storage_fee.capacity_at(height)?;
-            let periods = vp
-                .contract_storage_fee
-                .discount_periods(remaining, capacity, p_max)?;
-            let minimum = calc_contract_protocol_cost_min_with_periods(ctx, charge_bytes, periods)?;
+    let discount = match base::peek_block_contract_storage_snapshot(ctx.layer(), &vp, height)? {
+        Some(snapshot) if charge_bytes as u128 <= snapshot.remaining_quota() => {
+            let periods = vp.contract_storage_fee.discount_periods(
+                snapshot.remaining_start,
+                snapshot.capacity,
+                p_max,
+            )?;
+            let minimum =
+                calc_contract_protocol_cost_min_with_periods(ctx, charge_bytes, periods)?;
             Some((minimum, periods))
         }
-        None => None,
+        _ => None,
     };
     Ok(ContractStorageFeeQuote {
         charge_bytes,
@@ -370,11 +374,12 @@ fn check_link_contracts_exist(
     Ok(())
 }
 
-fn check_inherits_direct_parents_flat(
+fn check_static_inherit_parents(
     vmsta: &mut VMState,
     root_addr: &ContractAddress,
     root_contract: &ContractSto,
 ) -> Rerr {
+    // Keep v0 parent code immutable; future dynamic inheritance needs a new format version.
     for p in root_contract.inherit.as_list() {
         let sto = load_contract_for_check(vmsta, root_addr, root_contract, p, "inherit")?;
         if sto.inherit.length() > 0 {
@@ -382,6 +387,12 @@ fn check_inherits_direct_parents_flat(
                 "inherit parent {} cannot have parent inherit",
                 p.to_readable()
             );
+        }
+        if sto.library.length() > 0 {
+            return errf!("inherit parent {} cannot link libraries", p.to_readable());
+        }
+        if sto.have_abst_call(AbstCall::Change) || sto.have_abst_call(AbstCall::Append) {
+            return errf!("inherit parent {} must be update-locked", p.to_readable());
         }
     }
     Ok(())
@@ -626,9 +637,9 @@ fn check_static_call_targets(
 /// Unified two-phase contract storage fee boundary for deploy and update (§8.B1).
 ///
 /// Strict mode:
-/// * Pre-activation (or disabled profiles): legacy fixed-period full-price check,
+/// * Disabled profiles: legacy fixed-period full-price check,
 ///   `protocol_cost >= required_cost` semantics preserved (A07).
-/// * From `H0`: `protocol_cost >= F_full` pays full price and consumes no discount
+/// * Enabled: `protocol_cost >= F_full` pays full price and consumes no discount
 ///   quota; `F_discount <= protocol_cost < F_full` is an all-or-nothing discount
 ///   transaction that consumes `charge_bytes` from the block quota
 ///   `min(B_start, K_max)`; anything below `F_discount` is rejected — the user pays
@@ -950,10 +961,9 @@ mod contract_deploy_exec_tests {
         assert_eq!(burn_total(&mut ctx), cost.to_238_u128().unwrap());
     }
 
-    // ======================= storage fee budget discount (post-H0) =======================
+    // ======================= storage fee budget discount =======================
 
-    /// Storage discount schedule used by the deploy classification tests. H0 is far
-    /// above any other test height so the stub stays legacy for existing cases.
+    /// Storage discount schedule used by the deploy classification tests.
     const DISCOUNT_H0: u64 = 900_000;
 
     fn discount_profile() -> base::VmExecutionParams {
@@ -1021,16 +1031,13 @@ mod contract_deploy_exec_tests {
         amt.to_unit_u128(base::FEE_PRICING_UNIT).unwrap()
     }
 
-    /// A07/A04: before activation the deploy fee keeps the legacy fixed-period
-    /// `>=` check; at H0 the missing budget record initializes the budget full
-    /// (B0 = C), so the activation block itself already prices the floor
-    /// discount: discount-band deploys succeed and book quota.
+    /// Disabled profiles keep the legacy fixed-period `>=` check and never
+    /// touch quota. An enabled profile with a missing budget record opens at
+    /// `B0 = C`, so the floor discount is available immediately.
     #[test]
-    fn deploy_before_and_at_activation_stays_full_price() {
-        // pre-activation: legacy full price, `protocol_cost >= required`
+    fn deploy_disabled_is_full_price_and_enabled_missing_record_opens_full() {
+        // disabled: legacy full price, `protocol_cost >= required`
         let mut ctx = deploy_ctx(false);
-        ctx.vm_params = discount_profile();
-        ctx.env.block.height = DISCOUNT_H0 - 1;
         let addr = ctx.env.tx.main;
         prefund(
             &mut ctx,
@@ -1055,9 +1062,7 @@ mod contract_deploy_exec_tests {
             .unwrap_or_else(|e| panic!("legacy full-price deploy failed: {e}"));
         assert_eq!(used_discount_bytes(&ctx), 0, "legacy rule has no quota");
 
-        // at H0 with the record missing, init derives B_start = C (B0 = C): the
-        // budget opens full, so the discount is available at the floor price on
-        // the activation block itself
+        // enabled with the record missing: init derives B_start = C (B0 = C)
         let mut ctx = discount_ctx(false);
         ctx.env.block.height = DISCOUNT_H0;
         {
@@ -1086,7 +1091,7 @@ mod contract_deploy_exec_tests {
             act.contract = body;
             act.execute(ctx)
         };
-        // a discount-band deploy succeeds on the activation block and books bytes
+        // a discount-band deploy succeeds and books bytes
         deploy_at(
             &mut ctx,
             Amount::coin_u128(u232_of(&min_full) - 1, base::FEE_PRICING_UNIT),
@@ -1478,5 +1483,30 @@ mod contract_deploy_exec_tests {
         update.address = caddr.to_addr();
         update.edit = edit;
         update.execute(&mut ctx).unwrap();
+    }
+
+    /// A live snapshot with too little remaining quota must not advertise a
+    /// discount the execution path would reject.
+    #[test]
+    fn quote_omits_discount_when_charge_exceeds_remaining_quota() {
+        let mut ctx = seeded_discount_ctx(false, DISCOUNT_H0 + 1000, 1_000_000, 1_000_000);
+        let snapshot = read_block_contract_storage_snapshot(
+            &ctx.layer,
+            &ctx.vm_params,
+            ctx.env.block.height,
+        )
+        .unwrap()
+        .unwrap();
+        consume_block_contract_storage_discount(&mut ctx.layer, &snapshot, 16_000).unwrap();
+        let too_big = quote_contract_storage_fee(&mut ctx, 1_000).unwrap();
+        assert!(too_big.discount.is_none());
+        assert!(too_big.full_price.is_positive());
+        let fits = quote_contract_storage_fee(&mut ctx, 384).unwrap();
+        let (amount, periods) = fits.discount.expect("384 bytes still fit in K - D");
+        assert_eq!(periods, 10);
+        assert!(amount.is_positive());
+        let mut offline = discount_ctx(false);
+        let q = quote_contract_storage_fee(&mut offline, 100).unwrap();
+        assert!(q.discount.is_none());
     }
 }

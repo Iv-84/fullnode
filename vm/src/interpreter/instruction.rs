@@ -40,6 +40,19 @@ where
     locop_arithmetic3(x, &mut y, &mut z, f)
 }
 
+fn triop_fin(operand_stack: &mut Stack, spec: FinSpec) -> VmrtErr {
+    if spec.kernel != FinKernel::U64Mad {
+        return triop_arithmetic(operand_stack, |x, y, z| fin3_checked(spec, x, y, z));
+    }
+    // This kernel checks against the original base width, not the common width.
+    let z = operand_stack.pop()?.to_uint()?;
+    let y = operand_stack.pop()?.to_uint()?;
+    let x = operand_stack.peek()?;
+    let result = fin3_checked(spec, &x.to_uint()?, &y, &z)?;
+    *x = result;
+    Ok(())
+}
+
 fn locop_arithmetic4<F>(x: &mut Value, y: &mut Value, z: &mut Value, w: &mut Value, f: F) -> VmrtErr
 where
     F: FnOnce(&Value, &Value, &Value, &Value) -> VmrtRes<Value>,
@@ -266,7 +279,7 @@ fn bit_shift_overflow(op: &str, x: &Value, y: &Value) -> ItrErr {
     )
 }
 
-fn bit_shl(x: &Value, y: &Value) -> VmrtRes<Value> {
+pub(crate) fn bit_shl(x: &Value, y: &Value) -> VmrtRes<Value> {
     let res = match (x, y) {
         (U8(l), U8(r)) => <u8>::checked_shl(*l, *r as u32).map(Value::U8),
         (U16(l), U16(r)) => <u16>::checked_shl(*l, *r as u32).map(Value::U16),
@@ -286,7 +299,7 @@ fn bit_shl(x: &Value, y: &Value) -> VmrtRes<Value> {
     res.ok_or_else(|| bit_shift_overflow("left", x, y))
 }
 
-fn bit_shr(x: &Value, y: &Value) -> VmrtRes<Value> {
+pub(crate) fn bit_shr(x: &Value, y: &Value) -> VmrtRes<Value> {
     let res = match (x, y) {
         (U8(l), U8(r)) => <u8>::checked_shr(*l, *r as u32).map(Value::U8),
         (U16(l), U16(r)) => <u16>::checked_shr(*l, *r as u32).map(Value::U16),
@@ -948,6 +961,21 @@ fn scaled_addsub_checked(
     cast_uint_result3(x, out, op, x, y, z)
 }
 
+/// `base + index * stride` in 256-bit arithmetic. The product must fit `u128`
+/// and the sum must fit the width of `base`.
+fn u64_mad_checked(x: &Value, y: &Value, z: &Value) -> VmrtRes<Value> {
+    let err = || ItrErr::new(Arithmetic, &check_failed_tip3("u64_mad", x, y, z));
+    let base = x.extract_u128()?;
+    let index = y.extract_u128()?;
+    let stride = z.extract_u128()?;
+    let (hi, lo) = mul_wide_u128(index, stride);
+    if hi != 0 {
+        return Err(err());
+    }
+    let sum = lo.checked_add(base).ok_or_else(err)?;
+    cast_uint_result3(x, sum, "u64_mad", x, y, z)
+}
+
 fn muldiv_den_addsub_checked(
     x: &Value,
     y: &Value,
@@ -1284,6 +1312,7 @@ fn fin3_checked(spec: FinSpec, x: &Value, y: &Value, z: &Value) -> VmrtRes<Value
         FinKernel::MulDivDenSub => {
             muldiv_den_addsub_checked(x, y, z, false, round, spec.name)
         }
+        FinKernel::U64Mad => u64_mad_checked(x, y, z),
         _ => invalid_fin_spec(spec),
     }
 }
@@ -1380,3 +1409,143 @@ fn unary_dec(x: &mut Value, n: u8) -> VmrtErr {
         .map_err(|ItrErr(_, msg)| ItrErr::new(Arithmetic, &msg))
 }
 
+#[cfg(test)]
+mod fin_kernel_tests {
+    use super::*;
+
+    fn fee_add(amount: u64, bps: u64) -> Value {
+        let cap = SpaceCap::new(0);
+        let env = NativeFnEnv::new(&cap);
+        let argv = Value::pack_call_args(vec![Value::U64(amount), Value::U64(bps)]).unwrap();
+        NativeFunc::call_packed(env, NativeFunc::fee_add_bps_ceil as u8, argv)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn fee_add_bps_ceil_matches_scaled_add_ceil() {
+        for (amount, bps) in [(1u64, 0), (1, 1), (10_000, 30), (100, 10_000), (50, 1)] {
+            let scaled = scaled_addsub_checked(
+                &Value::U64(amount),
+                &Value::U64(bps),
+                &Value::U64(10_000),
+                true,
+                FinRoundPolicy::Ceil,
+                "scaled_add_ceil",
+            )
+            .unwrap();
+            assert_eq!(scaled, fee_add(amount, bps));
+        }
+    }
+
+    #[test]
+    fn u64_mad_uses_the_base_width() {
+        assert_eq!(
+            u64_mad_checked(&Value::U64(10), &Value::U64(3), &Value::U64(4)).unwrap(),
+            Value::U64(22)
+        );
+        assert_eq!(
+            u64_mad_checked(
+                &Value::U64(0),
+                &Value::U128(0),
+                &Value::U128(u64::MAX as u128)
+            )
+            .unwrap(),
+            Value::U64(0)
+        );
+        assert_eq!(
+            u64_mad_checked(
+                &Value::U64(0),
+                &Value::U128(u64::MAX as u128),
+                &Value::U128(1)
+            )
+            .unwrap(),
+            Value::U64(u64::MAX)
+        );
+        assert_eq!(
+            u64_mad_checked(&Value::U128(0), &Value::U64(u64::MAX), &Value::U64(2)).unwrap(),
+            Value::U128((u64::MAX as u128) * 2)
+        );
+        assert_eq!(
+            u64_mad_checked(&Value::U8(200), &Value::U8(1), &Value::U8(100))
+                .unwrap_err()
+                .0,
+            Arithmetic
+        );
+        assert_eq!(
+            u64_mad_checked(
+                &Value::U64(1),
+                &Value::U128(u64::MAX as u128),
+                &Value::U128(1)
+            )
+            .unwrap_err()
+            .0,
+            Arithmetic
+        );
+        assert_eq!(
+            u64_mad_checked(
+                &Value::U64(1),
+                &Value::U128(1 << 100),
+                &Value::U128(1 << 100)
+            )
+            .unwrap_err()
+            .0,
+            Arithmetic
+        );
+        assert_eq!(
+            u64_mad_checked(&Value::U128(u128::MAX), &Value::U128(1), &Value::U128(1))
+                .unwrap_err()
+                .0,
+            Arithmetic
+        );
+    }
+
+    #[test]
+    fn fee_add_bps_ceil_rounds_up_without_wrapping() {
+        let ceil_repay = |amount: u64, bps: u64| -> Option<u64> {
+            let product = amount as u128 * bps as u128;
+            let fee = product / 10_000 + u128::from(product % 10_000 != 0);
+            u64::try_from(amount as u128 + fee).ok()
+        };
+        let samples = [
+            (0, 0),
+            (0, 1),
+            (0, u64::MAX),
+            (1, 0),
+            (1, 1),
+            (1, 5000),
+            (1, 9999),
+            (1, 10_000),
+            (1, u64::MAX),
+            (2, 5000),
+            (3, 5000),
+            (9999, 1),
+            (10_000, 1),
+            (10_000, 30),
+            (u64::MAX, 0),
+            (u64::MAX / 2, 10_000),
+        ];
+        for (amount, bps) in samples {
+            let got = fee_add(amount, bps);
+            let expect = ceil_repay(amount, bps).unwrap();
+            assert_eq!(got, Value::U64(expect), "amount {amount} bps {bps}");
+            let floor = amount as u128 + (amount as u128 * bps as u128) / 10_000;
+            if (amount as u128 * bps as u128) % 10_000 != 0 {
+                assert_ne!(expect as u128, floor, "ceil collapsed to floor");
+            }
+        }
+        for (amount, bps) in [
+            (u64::MAX, 1),
+            (u64::MAX / 2 + 1, 10_000),
+            (10_000, u64::MAX),
+        ] {
+            let cap = SpaceCap::new(0);
+            let env = NativeFnEnv::new(&cap);
+            let argv = Value::pack_call_args(vec![Value::U64(amount), Value::U64(bps)]).unwrap();
+            assert!(
+                NativeFunc::call_packed(env, NativeFunc::fee_add_bps_ceil as u8, argv).is_err(),
+                "amount {amount} bps {bps} must not wrap"
+            );
+        }
+    }
+}

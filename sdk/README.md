@@ -1,6 +1,6 @@
-# Hacash Unified SDK 2.0
+# Hacash SDK
 
-The fullnode WASM SDK rebuilt under Unified SDK 2.0 (doc 14 `unified-sdk-major-version-design.md`). Design points:
+The fullnode WASM SDK (doc 14 `unified-sdk-major-version-design.md`). Design points:
 
 - **No v1/v2 namespaces**: one surface, one release line; the exposed
   capability set is exactly the operation registry (`profile::OPERATIONS`),
@@ -176,9 +176,10 @@ with `codeconf`/`code_type`/`code_type_name`/`codes_len`/`codes_hash`/
 inline from `action-desc@2`'s `code` metadata + `codes_preview`; long code
 opens a viewer that calls `vm.code` with `format`/`limit`/`offset` paging and
 an optional external `sourcemap` (lib/function/slot/const names) for maximum
-readability. Bytecode disassembles to annotated assembly; IR decompiles to
-fitsh source (or a structural `tree` view). All decompilation is offline and
-codec-only — no VM execution, no node.
+readability. Bytecode disassembles to Form 2 readable assembly (`assembly`)
+or a dense opcode stream (`raw`); IR decompiles to fitsh source, a structural
+`tree` view, or the same Form 2 / raw assembly. All decompilation is offline
+and codec-only — no VM execution, no node.
 
 ### 4. Registered codec surface
 
@@ -203,7 +204,7 @@ dist/
 ├── js/hacashsdk.mjs        # raw JSON facade (create_hacash_sdk), platform-agnostic
 ├── nodejs/hacashsdk.js     # wasm-bindgen node glue  + hacashsdk_bg.wasm (+ .d.ts)
 ├── web/hacashsdk.js        # wasm-bindgen web glue    + hacashsdk_bg.wasm (+ .d.ts)
-└── page/hacashsdk_bg.js    # single-file browser build, wasm base64-inlined
+└── page/hacash_sdk.js      # single-file browser build, wasm base64-inlined
 ```
 
 ## Building
@@ -228,7 +229,7 @@ and optionally minifies. All artifacts land in `sdk/dist/`:
 - `js/hacashsdk.mjs` — raw JSON transport (node auto-loads `../nodejs/`;
   web uses `create_hacash_sdk({ wasm })` to load `../web/`).
 - `nodejs/`, `web/` — the platform wasm-bindgen low-level glue + wasm.
-- `page/` — a single-file browser build: `hacashsdk_bg.js` (base64-inlined
+- `page/` — a single-file browser build: `hacash_sdk.js` (base64-inlined
   wasm).
 
 Build artifacts (`dist/`, `*.bak`, ...) are git-ignored (see `sdk/.gitignore`).
